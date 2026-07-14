@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Rust
+target/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# Benchmark artifacts
+*.log
+
+# Hugging Face / model cache
+.cache/
