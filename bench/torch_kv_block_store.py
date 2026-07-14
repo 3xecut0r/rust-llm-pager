@@ -209,3 +209,9 @@ class KVBlockStore:
             "to_gpu": moved_to_gpu,
             "to_cpu": moved_to_cpu,
         }
+
+    def get_gpu(self, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if block_id not in self.gpu_blocks:
+            raise KeyError(f"Block {block_id} is not on GPU.")
+
+        return self.gpu_blocks[block_id]
