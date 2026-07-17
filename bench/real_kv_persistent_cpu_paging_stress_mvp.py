@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -191,6 +193,12 @@ def reload_all_blocks_for_forward(
     moved_copies = after["cpu_to_gpu_copies"] - before["cpu_to_gpu_copies"]
 
     return moved_bytes, moved_copies
+
+
+def write_results_json(results: dict) -> Path:
+    out_path = Path("bench/persistent_cpu_paging_stress_results.json")
+    out_path.write_text(json.dumps(results, indent=2))
+    return out_path
 
 
 def main() -> None:
@@ -453,6 +461,28 @@ def main() -> None:
     )
     print("min_attention_in_gpu:", f"{min(attention_in_gpu_values):.4f}")
     print("max_attention_in_gpu:", f"{max(attention_in_gpu_values):.4f}")
+
+    results = {
+        "policy": POLICY,
+        "generate_tokens": generate_tokens,
+        "same_token_ids": baseline_generated == generated,
+        "total_new_blocks": total_new_blocks,
+        "final_num_blocks": num_blocks,
+        "total_gpu_to_cpu_mb": total_gpu_to_cpu_bytes / 1_000_000,
+        "total_cpu_to_gpu_mb": total_cpu_to_gpu_bytes / 1_000_000,
+        "total_gpu_to_cpu_copies": total_gpu_to_cpu_copies,
+        "total_cpu_to_gpu_copies": total_cpu_to_gpu_copies,
+        "mean_attention_in_gpu": sum(attention_in_gpu_values) / len(attention_in_gpu_values),
+        "min_attention_in_gpu": min(attention_in_gpu_values),
+        "max_attention_in_gpu": max(attention_in_gpu_values),
+        "final_gpu_blocks": store.gpu_block_ids(),
+        "final_cpu_blocks": store.cpu_block_ids(),
+        "baseline_ids": baseline_generated,
+        "paged_ids": generated,
+    }
+
+    json_path = write_results_json(results)
+    print("\nresults_json:", json_path)
 
     assert baseline_generated == generated
 
