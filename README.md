@@ -32,6 +32,9 @@ Implemented and validated:
 - Identical multi-token greedy generation after KV reconstruction.
 - Paged real Qwen generation loop.
 - Baseline vs paged generation comparison with identical token IDs.
+- Persistent CPU KV paging loop with a single long-lived store and pager across generation.
+- Growing KV store (new full blocks appended mid-generation) without breaking correctness.
+- Policy comparison (`recent_only`, `sinks_recent`, `heavy_hitter`, `sinks_heavy_hitter`) inside the persistent loop.
 
 Current headline result:
 
@@ -376,6 +379,48 @@ This confirms that the paged real Qwen KV loop can preserve exact greedy generat
 
 ---
 
+## Persistent CPU KV paging (real Qwen)
+
+The paged generation loop above rebuilds the KV store from scratch on every run. The persistent paging MVPs go one step further: a single `KVBlockStore` and Rust `PyPager` live across the entire generation loop, and new full KV blocks are appended to the store as they are produced (the recent "tail" is kept hot until it fills a block).
+
+Test flow, repeated every generation step:
+
+```text
+persistent KV store (built once)
+-> reload any GPU-needed blocks for this step
+-> reconstruct full-block KV + hot tail
+-> forward pass, get next token + attention
+-> append newly completed full blocks to the store
+-> Rust pager scores blocks and (re)places tiers
+-> apply GPU/CPU tier movement
+-> repeat
+```
+
+Three MVPs validate this end to end:
+
+| Script | Tokens | Purpose |
+|---|---:|---|
+| `real_kv_persistent_cpu_paging_loop_mvp.py` | 24 | Smoke test of the persistent loop. |
+| `real_kv_persistent_cpu_paging_stress_mvp.py` | 64 | Longer run that forces multiple new blocks to appear. |
+| `real_kv_persistent_policy_compare_mvp.py` | 64 (configurable) | Runs all four policies through the same persistent loop and compares them. |
+
+All three assert `same_token_ids == True` against a plain greedy baseline, i.e. persistent GPU ↔ CPU paging plus block growth does not change generation output.
+
+Both persistent MVPs accept `--tokens N` (override generated token count) and `--quiet` (suppress per-step debug output, print only the final summary).
+
+Latest policy comparison (`real_kv_persistent_policy_compare_mvp.py`, 64 tokens):
+
+| Policy | Same as baseline | New blocks | Final blocks | Mean attn in VRAM | Min attn in VRAM |
+|---|---|---:|---:|---:|---:|
+| `heavy_hitter` | True | 4 | 13 | 0.8717 | 0.5137 |
+| `sinks_heavy_hitter` | True | 4 | 13 | 0.8627 | 0.6805 |
+| `recent_only` | True | 4 | 13 | 0.6244 | 0.3686 |
+| `sinks_recent` | True | 4 | 13 | 0.6244 | 0.3686 |
+
+`heavy_hitter` and `sinks_heavy_hitter` keep noticeably more attention mass resident in VRAM than the recency-only policies, while all four preserve exact baseline token IDs. Full results (including GPU/CPU byte counts and final block placement) are written to [`bench/persistent_policy_compare_results.csv`](bench/persistent_policy_compare_results.csv) and [`bench/persistent_policy_compare_results.md`](bench/persistent_policy_compare_results.md) on every run.
+
+---
+
 ## Repository layout
 
 ```text
@@ -403,6 +448,10 @@ bench/
   real_kv_generation_roundtrip_mvp.py
   real_kv_paged_generation_loop_mvp.py
   real_kv_paged_generation_compare_mvp.py
+
+  real_kv_persistent_cpu_paging_loop_mvp.py
+  real_kv_persistent_cpu_paging_stress_mvp.py
+  real_kv_persistent_policy_compare_mvp.py
 ```
 
 ---
@@ -495,6 +544,20 @@ python bench/real_kv_paged_generation_loop_mvp.py
 python bench/real_kv_paged_generation_compare_mvp.py
 ```
 
+Run persistent CPU KV paging demos:
+
+```bash
+python bench/real_kv_persistent_cpu_paging_loop_mvp.py
+python bench/real_kv_persistent_cpu_paging_stress_mvp.py
+python bench/real_kv_persistent_policy_compare_mvp.py
+```
+
+The persistent scripts accept `--tokens N` and `--quiet`, e.g.:
+
+```bash
+python bench/real_kv_persistent_policy_compare_mvp.py --tokens 64 --quiet
+```
+
 The most important current demo is:
 
 ```bash
@@ -558,7 +621,8 @@ research prototype / MVP
 Current milestone:
 
 ```text
-baseline-equivalent paged Qwen KV generation with real GPU <-> CPU tensor movement
+persistent, growing real Qwen KV store with GPU <-> CPU paging across all four
+placement policies, matching baseline greedy generation exactly
 ```
 
 Next milestone:

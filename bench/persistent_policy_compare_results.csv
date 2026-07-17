@@ -1,0 +1,5 @@
+policy,same_token_ids,total_new_blocks,final_num_blocks,total_gpu_to_cpu_mb,total_cpu_to_gpu_mb,total_gpu_to_cpu_copies,total_cpu_to_gpu_copies,mean_attention_in_gpu,min_attention_in_gpu,max_attention_in_gpu,final_gpu_blocks,final_cpu_blocks,added_block_events
+recent_only,True,4,13,49.545216,48.365568,252,246,0.6244293931867789,0.3686153406407789,0.8856164195457339,"[0, 1, 2, 3, 4, 5, 6]","[7, 8, 9, 10, 11, 12]",step 10: [9]; step 26: [10]; step 42: [11]; step 58: [12]
+sinks_recent,True,4,13,49.545216,48.365568,252,246,0.6244293931867789,0.3686153406407789,0.8856164195457339,"[0, 1, 2, 3, 4, 5, 6]","[7, 8, 9, 10, 11, 12]",step 10: [9]; step 26: [10]; step 42: [11]; step 58: [12]
+heavy_hitter,True,4,13,49.545216,48.365568,252,246,0.8716729133631866,0.5137213903482802,0.967431141712057,"[0, 5, 8, 9, 10, 11, 12]","[1, 2, 3, 4, 6, 7]",step 10: [9]; step 26: [10]; step 42: [11]; step 58: [12]
+sinks_heavy_hitter,True,4,13,49.545216,48.365568,252,246,0.8627203931018701,0.6805419697865122,0.9543367689840457,"[0, 1, 2, 3, 10, 11, 12]","[4, 5, 6, 7, 8, 9]",step 10: [9]; step 26: [10]; step 42: [11]; step 58: [12]

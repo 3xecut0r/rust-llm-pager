@@ -27,55 +27,6 @@ from torch_kv_block_store import KVBlockStore
 from torch_kv_offload_mvp import print_summary
 
 
-def reconstruct_past_from_store(
-        *,
-        store: KVBlockStore,
-        num_layers: int,
-        num_blocks: int,
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """
-    Reconstruct legacy past_key_values from GPU-resident KV blocks.
-
-    Input block shape:
-        [layers, tokens_per_block, kv_heads, head_dim]
-
-    Output per layer:
-        key/value shape: [batch, kv_heads, seq_len, head_dim]
-    """
-    layer_keys: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
-    layer_values: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
-
-    for block_id in range(num_blocks):
-        block_key, block_value = store.get_gpu(block_id)
-
-        for layer_idx in range(num_layers):
-            key_slice = block_key[layer_idx]      # [tokens, heads, dim]
-            value_slice = block_value[layer_idx]  # [tokens, heads, dim]
-
-            # [tokens, heads, dim] -> [heads, tokens, dim]
-            layer_keys[layer_idx].append(
-                key_slice.permute(1, 0, 2).contiguous()
-            )
-            layer_values[layer_idx].append(
-                value_slice.permute(1, 0, 2).contiguous()
-            )
-
-    reconstructed = []
-
-    for layer_idx in range(num_layers):
-        # [heads, seq, dim]
-        key = torch.cat(layer_keys[layer_idx], dim=1)
-        value = torch.cat(layer_values[layer_idx], dim=1)
-
-        # [batch, heads, seq, dim]
-        key = key.unsqueeze(0).contiguous()
-        value = value.unsqueeze(0).contiguous()
-
-        reconstructed.append((key, value))
-
-    return reconstructed
-
-
 def compare_past(
         *,
         original_past,

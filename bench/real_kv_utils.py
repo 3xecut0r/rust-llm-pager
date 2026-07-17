@@ -272,3 +272,47 @@ def format_block_list(block_ids: list[int], limit: int = 30) -> str:
     remaining = len(block_ids) - limit
 
     return f"{shown} ... (+{remaining} more)"
+
+def extract_single_block_from_past(
+        past_key_values,
+        *,
+        block_id: int,
+        tokens_per_block: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not past_key_values:
+        raise ValueError("past_key_values is empty.")
+
+    first_key = past_key_values[0][0]
+
+    if first_key.ndim != 4:
+        raise ValueError(
+            f"Expected KV tensor shape [batch, heads, seq, dim], got {first_key.shape}"
+        )
+
+    batch, _, seq_len, _ = first_key.shape
+
+    if batch != 1:
+        raise ValueError("This MVP expects batch size 1.")
+
+    start = block_id * tokens_per_block
+    end = start + tokens_per_block
+
+    if end > seq_len:
+        raise ValueError(
+            f"Block {block_id} is not fully available: end={end}, seq_len={seq_len}"
+        )
+
+    block_keys = []
+    block_values = []
+
+    for layer_key, layer_value in past_key_values:
+        key_slice = layer_key[0, :, start:end, :].permute(1, 0, 2).contiguous()
+        value_slice = layer_value[0, :, start:end, :].permute(1, 0, 2).contiguous()
+
+        block_keys.append(key_slice)
+        block_values.append(value_slice)
+
+    block_key = torch.stack(block_keys, dim=0).contiguous()
+    block_value = torch.stack(block_values, dim=0).contiguous()
+
+    return block_key, block_value

@@ -93,9 +93,17 @@ impl Pager {
         self.pin_blocks(token_idx);
 
         if self.metrics.tokens == 1 || self.metrics.tokens % self.cfg.rebalance_interval == 0 {
-            self.place_blocks();
-            self.update_memory_peaks();
+            self.force_rebalance(token_idx);
         }
+    }
+
+    pub fn force_rebalance(&mut self, token_idx: u64) {
+        let block_count = token_idx as usize + 1;
+
+        self.ensure_blocks(block_count);
+        self.pin_blocks(token_idx);
+        self.place_blocks();
+        self.update_memory_peaks();
     }
 
     pub fn metrics(&self) -> Metrics {

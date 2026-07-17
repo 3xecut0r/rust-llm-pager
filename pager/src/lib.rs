@@ -49,6 +49,10 @@ impl PyPager {
         self.inner.on_step(token_idx, layer, attention);
     }
 
+    fn force_rebalance(&mut self, token_idx: u64) {
+        self.inner.force_rebalance(token_idx);
+    }
+
     fn metrics(&self) -> Metrics {
         self.inner.metrics()
     }

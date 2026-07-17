@@ -5,7 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import pager
-from real_kv_cache_block_mvp import (
+from config import (
     MODEL_NAME,
     TOKENS_PER_BLOCK,
     MAX_LENGTH,
@@ -16,21 +16,19 @@ from real_kv_cache_block_mvp import (
     PROMOTE_MARGIN,
     RAM_PROMOTE_MARGIN,
     POLICY,
+    GENERATE_TOKENS,
+)
+from real_kv_utils import (
     build_prompt,
     get_legacy_past_key_values,
     real_past_to_blocks,
     extract_last_query_block_attention,
-)
-from real_kv_paged_generation_loop_mvp import (
     split_full_blocks_and_tail,
     append_tail_to_reconstructed_past,
+    reconstruct_past_from_store,
     format_block_list,
 )
-from real_kv_roundtrip_mvp import reconstruct_past_from_store
 from torch_kv_block_store import KVBlockStore
-
-
-GENERATE_TOKENS = 8
 
 
 def greedy_baseline_generate(
@@ -152,7 +150,8 @@ def paged_generate(
 
     for step in range(1, steps + 1):
         full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-            current_past
+            current_past,
+            tokens_per_block=TOKENS_PER_BLOCK,
         )
 
         tail_tokens = tail_past[0][0].shape[2]

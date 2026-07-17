@@ -5,7 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import pager
-from real_kv_cache_block_mvp import (
+from config import (
     MODEL_NAME,
     TOKENS_PER_BLOCK,
     MAX_LENGTH,
@@ -16,86 +16,20 @@ from real_kv_cache_block_mvp import (
     PROMOTE_MARGIN,
     RAM_PROMOTE_MARGIN,
     POLICY,
+    GENERATE_TOKENS,
+)
+from real_kv_utils import (
     build_prompt,
     get_legacy_past_key_values,
     real_past_to_blocks,
     extract_last_query_block_attention,
+    split_full_blocks_and_tail,
+    append_tail_to_reconstructed_past,
+    reconstruct_past_from_store,
+    format_block_list,
 )
-from real_kv_roundtrip_mvp import reconstruct_past_from_store
 from torch_kv_block_store import KVBlockStore
-from torch_kv_offload_mvp import print_summary
 
-
-GENERATE_TOKENS = 8
-
-
-def format_block_list(block_ids: list[int], limit: int = 30) -> str:
-    if len(block_ids) <= limit:
-        return str(block_ids)
-
-    shown = block_ids[:limit]
-    remaining = len(block_ids) - limit
-    return f"{shown} ... (+{remaining} more)"
-
-
-def trim_tail_to_full_blocks(past_key_values):
-    """
-    Keep only full TOKENS_PER_BLOCK blocks.
-    """
-    seq_len = past_key_values[0][0].shape[2]
-    full_tokens = (seq_len // TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK
-
-    trimmed = []
-
-    for key, value in past_key_values:
-        trimmed.append(
-            (
-                key[:, :, :full_tokens, :].contiguous(),
-                value[:, :, :full_tokens, :].contiguous(),
-            )
-        )
-
-    return trimmed, full_tokens
-
-def split_full_blocks_and_tail(past_key_values):
-    seq_len = past_key_values[0][0].shape[2]
-    full_tokens = (seq_len // TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK
-
-    full_past = []
-    tail_past = []
-
-    for key, value in past_key_values:
-        full_past.append(
-            (
-                key[:, :, :full_tokens, :].contiguous(),
-                value[:, :, :full_tokens, :].contiguous(),
-            )
-        )
-        tail_past.append(
-            (
-                key[:, :, full_tokens:, :].contiguous(),
-                value[:, :, full_tokens:, :].contiguous(),
-            )
-        )
-
-    return full_past, tail_past, full_tokens
-
-
-def append_tail_to_reconstructed_past(
-        reconstructed_past,
-        tail_past,
-):
-    out = []
-
-    for (rec_key, rec_value), (tail_key, tail_value) in zip(
-            reconstructed_past,
-            tail_past,
-    ):
-        key = torch.cat([rec_key, tail_key], dim=2).contiguous()
-        value = torch.cat([rec_value, tail_value], dim=2).contiguous()
-        out.append((key, value))
-
-    return out
 
 def rebuild_store_from_past(
         past_key_values,
@@ -107,7 +41,8 @@ def rebuild_store_from_past(
     and appended back before the next model forward.
     """
     full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-        past_key_values
+        past_key_values,
+        tokens_per_block=TOKENS_PER_BLOCK,
     )
 
     kv_blocks = real_past_to_blocks(
@@ -255,10 +190,10 @@ def main() -> None:
 
         summary_after_offload = store.summary()
 
-        gpu_to_cpu_before_reload = summary_after_offload["gpu_to_cpu_bytes"]
         cpu_to_gpu_before_reload = summary_after_offload["cpu_to_gpu_bytes"]
-        gpu_to_cpu_copies_before_reload = summary_after_offload["gpu_to_cpu_copies"]
-        cpu_to_gpu_copies_before_reload = summary_after_offload["cpu_to_gpu_copies"]
+        cpu_to_gpu_copies_before_reload = summary_after_offload[
+            "cpu_to_gpu_copies"
+        ]
 
         real_attention_in_gpu = sum(
             block_attention[block_id]
@@ -301,10 +236,11 @@ def main() -> None:
         total_cpu_to_gpu_copies += summary_after_reload["cpu_to_gpu_copies"]
 
         step_cpu_to_gpu_mb = (
-                                     summary_after_reload["cpu_to_gpu_bytes"] - cpu_to_gpu_before_reload
-                             ) / 1_000_000
+            summary_after_reload["cpu_to_gpu_bytes"] - cpu_to_gpu_before_reload
+        ) / 1_000_000
         step_cpu_to_gpu_copies = (
-                summary_after_reload["cpu_to_gpu_copies"] - cpu_to_gpu_copies_before_reload
+            summary_after_reload["cpu_to_gpu_copies"]
+            - cpu_to_gpu_copies_before_reload
         )
         print("cpu_to_gpu_reload_mb:", f"{step_cpu_to_gpu_mb:.2f}")
         print("cpu_to_gpu_reload_copies:", step_cpu_to_gpu_copies)
