@@ -3,7 +3,8 @@ from __future__ import annotations
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from real_kv_cache_block_mvp import (
+import pager
+from config import (
     MODEL_NAME,
     TOKENS_PER_BLOCK,
     MAX_LENGTH,
@@ -14,15 +15,16 @@ from real_kv_cache_block_mvp import (
     PROMOTE_MARGIN,
     RAM_PROMOTE_MARGIN,
     POLICY,
+)
+from real_kv_utils import (
     build_prompt,
     get_legacy_past_key_values,
     real_past_to_blocks,
     extract_last_query_block_attention,
+    reconstruct_past_from_store,
 )
 from torch_kv_block_store import KVBlockStore
-from torch_kv_offload_mvp import bytes_to_mb, print_summary
-
-import pager
+from torch_kv_offload_mvp import print_summary
 
 
 def reconstruct_past_from_store(
