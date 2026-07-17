@@ -4,24 +4,27 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import pager
+from config import (
+    MODEL_NAME,
+    TOKENS_PER_BLOCK,
+    MAX_LENGTH,
+    VRAM_BUDGET,
+    RAM_BUDGET,
+    RECENT_WINDOW,
+    REBALANCE_INTERVAL,
+    PROMOTE_MARGIN,
+    RAM_PROMOTE_MARGIN,
+    POLICY,
+)
+from real_kv_utils import (
+    build_prompt,
+    get_legacy_past_key_values,
+    real_past_to_blocks,
+    extract_last_query_block_attention,
+    format_block_list,
+)
 from torch_kv_block_store import KVBlockStore
 from torch_kv_offload_mvp import bytes_to_mb, print_summary
-
-
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
-
-TOKENS_PER_BLOCK = 16
-MAX_LENGTH = 192
-
-VRAM_BUDGET = 128_000_000
-RAM_BUDGET = 2_000_000_000
-
-RECENT_WINDOW = 64
-REBALANCE_INTERVAL = 4
-PROMOTE_MARGIN = 0.05
-RAM_PROMOTE_MARGIN = 0.20
-
-POLICY = "sinks_heavy_hitter"
 
 
 def format_block_list(block_ids: list[int], limit: int = 30) -> str:
