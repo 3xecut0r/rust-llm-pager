@@ -553,3 +553,153 @@ impl Pager {
 fn compare_scores(a: f32, b: f32) -> Ordering {
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK_SIZE: usize = 16 * 1024 * 1024;
+
+    fn make_pager(vram_blocks: usize, ram_blocks: usize, recent_window: usize, policy: &str) -> Pager {
+        Pager::new(
+            vram_blocks * BLOCK_SIZE,
+            ram_blocks * BLOCK_SIZE,
+            recent_window,
+            4,
+            0.05,
+            0.20,
+            policy.to_string(),
+        )
+    }
+
+    fn drive_blocks(pager: &mut Pager, count: u64) {
+        for i in 0..count {
+            pager.on_step(i, 0, vec![1.0; (i + 1) as usize]);
+            pager.force_rebalance(i);
+        }
+    }
+
+    #[test]
+    fn unknown_policy_name_falls_back_to_heavy_hitter() {
+        assert_eq!(Policy::from_name("not_a_real_policy"), Policy::HeavyHitter);
+        assert_eq!(Policy::from_name("recent_only"), Policy::RecentOnly);
+        assert_eq!(Policy::from_name("sinks_recent"), Policy::SinksRecent);
+        assert_eq!(Policy::from_name("heavy_hitter"), Policy::HeavyHitter);
+        assert_eq!(Policy::from_name("sinks_heavy_hitter"), Policy::SinksHeavyHitter);
+    }
+
+    #[test]
+    fn recent_only_respects_vram_budget() {
+        let mut pager = make_pager(2, 100, 1, "recent_only");
+        drive_blocks(&mut pager, 5);
+
+        let vram_ids = pager.vram_block_ids();
+        assert_eq!(vram_ids.len(), 2, "vram_ids: {:?}", vram_ids);
+    }
+
+    #[test]
+    fn recent_only_keeps_the_most_recent_blocks() {
+        let mut pager = make_pager(2, 100, 1, "recent_only");
+        drive_blocks(&mut pager, 5);
+
+        let vram_ids = pager.vram_block_ids();
+        assert!(vram_ids.contains(&3), "vram_ids: {:?}", vram_ids);
+        assert!(vram_ids.contains(&4), "vram_ids: {:?}", vram_ids);
+    }
+
+    #[test]
+    fn sinks_recent_keeps_a_sink_block_resident_even_when_old() {
+        let mut pager = make_pager(3, 100, 1, "sinks_recent");
+        drive_blocks(&mut pager, 10);
+
+        let vram_ids = pager.vram_block_ids();
+        assert!(
+            vram_ids.iter().any(|&id| id < 4),
+            "expected a sink block (id < 4) in vram_ids: {:?}",
+            vram_ids
+        );
+    }
+
+    #[test]
+    fn recent_only_ignores_attention_scores_for_placement() {
+        // Even if one block gets a huge score, recent_only must still place
+        // purely by recency/id, never promoting an old high-score block.
+        let mut pager = make_pager(2, 100, 1, "recent_only");
+
+        pager.on_step(0, 0, vec![1000.0]);
+        pager.force_rebalance(0);
+        drive_blocks(&mut pager, 6);
+
+        let vram_ids = pager.vram_block_ids();
+        assert!(
+            !vram_ids.contains(&0),
+            "recent_only must not keep an old block resident just because \
+             it once had a high score: {:?}",
+            vram_ids
+        );
+    }
+
+    #[test]
+    fn ensure_blocks_grows_monotonically_and_assigns_sequential_ids() {
+        let mut pager = make_pager(10, 10, 4, "recent_only");
+        pager.on_step(0, 0, vec![1.0, 1.0, 1.0]);
+
+        let tiers = pager.tiers();
+        assert_eq!(tiers.len(), 3);
+    }
+
+    #[test]
+    fn metrics_tokens_counts_on_step_calls() {
+        let mut pager = make_pager(5, 100, 10, "recent_only");
+        assert_eq!(pager.metrics().tokens, 0);
+
+        pager.on_step(0, 0, vec![1.0]);
+        pager.on_step(1, 0, vec![1.0, 1.0]);
+        pager.on_step(2, 0, vec![1.0, 1.0, 1.0]);
+
+        assert_eq!(pager.metrics().tokens, 3);
+    }
+
+    #[test]
+    fn metrics_vram_peak_never_exceeds_budget() {
+        let mut pager = make_pager(2, 100, 1, "sinks_heavy_hitter");
+        drive_blocks(&mut pager, 20);
+
+        let vram_peak = pager.metrics().vram_peak;
+        assert!(
+            vram_peak <= 2 * BLOCK_SIZE,
+            "vram_peak {} exceeded budget {}",
+            vram_peak,
+            2 * BLOCK_SIZE
+        );
+    }
+
+    #[test]
+    fn tiers_never_reports_more_vram_blocks_than_the_budget_allows() {
+        for policy in ["recent_only", "sinks_recent", "heavy_hitter", "sinks_heavy_hitter"] {
+            let mut pager = make_pager(3, 100, 2, policy);
+            drive_blocks(&mut pager, 15);
+
+            let vram_ids = pager.vram_block_ids();
+            assert!(
+                vram_ids.len() <= 3,
+                "policy {} put {} blocks in vram (budget 3): {:?}",
+                policy,
+                vram_ids.len(),
+                vram_ids
+            );
+        }
+    }
+
+    #[test]
+    fn force_rebalance_is_idempotent() {
+        let mut pager = make_pager(2, 100, 1, "recent_only");
+        drive_blocks(&mut pager, 5);
+
+        let before = pager.vram_block_ids();
+        pager.force_rebalance(4);
+        let after = pager.vram_block_ids();
+
+        assert_eq!(before, after);
+    }
+}

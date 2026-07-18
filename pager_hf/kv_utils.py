@@ -54,6 +54,14 @@ def extract_single_block_from_past(
         block_id: int,
         tokens_per_block: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract one block's (key, value) across all layers, keeping the batch
+    dimension intact so a block can hold more than one sequence at once
+    (all sequences in a batch must share block placement to be reconstructed
+    into a single batched forward call).
+
+    Returned shape per tensor: [num_layers, batch, block_len, kv_heads, head_dim].
+    """
     start = block_id * tokens_per_block
     end = start + tokens_per_block
 
@@ -61,8 +69,9 @@ def extract_single_block_from_past(
     block_values = []
 
     for layer_key, layer_value in past_key_values:
-        key_slice = layer_key[0, :, start:end, :].permute(1, 0, 2).contiguous()
-        value_slice = layer_value[0, :, start:end, :].permute(1, 0, 2).contiguous()
+        # [batch, kv_heads, block_len, head_dim] -> [batch, block_len, kv_heads, head_dim]
+        key_slice = layer_key[:, :, start:end, :].permute(0, 2, 1, 3).contiguous()
+        value_slice = layer_value[:, :, start:end, :].permute(0, 2, 1, 3).contiguous()
 
         block_keys.append(key_slice)
         block_values.append(value_slice)
@@ -162,6 +171,12 @@ def reconstruct_past_from_store(
         num_layers: int,
         num_blocks: int,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Inverse of extract_single_block_from_past: turns stored blocks (each
+    [num_layers, batch, block_len, kv_heads, head_dim]) back into the
+    standard HF past_key_values layout, [batch, kv_heads, seq_len, head_dim]
+    per layer, for any batch size.
+    """
     layer_keys: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
     layer_values: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
 
@@ -172,21 +187,19 @@ def reconstruct_past_from_store(
             key_slice = block_key[layer_idx]
             value_slice = block_value[layer_idx]
 
+            # [batch, block_len, kv_heads, head_dim] -> [batch, kv_heads, block_len, head_dim]
             layer_keys[layer_idx].append(
-                key_slice.permute(1, 0, 2).contiguous()
+                key_slice.permute(0, 2, 1, 3).contiguous()
             )
             layer_values[layer_idx].append(
-                value_slice.permute(1, 0, 2).contiguous()
+                value_slice.permute(0, 2, 1, 3).contiguous()
             )
 
     reconstructed = []
 
     for layer_idx in range(num_layers):
-        key = torch.cat(layer_keys[layer_idx], dim=1)
-        value = torch.cat(layer_values[layer_idx], dim=1)
-
-        key = key.unsqueeze(0).contiguous()
-        value = value.unsqueeze(0).contiguous()
+        key = torch.cat(layer_keys[layer_idx], dim=2).contiguous()
+        value = torch.cat(layer_values[layer_idx], dim=2).contiguous()
 
         reconstructed.append((key, value))
 

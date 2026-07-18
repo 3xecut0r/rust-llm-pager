@@ -423,7 +423,7 @@ Latest policy comparison (`real_kv_persistent_policy_compare_mvp.py`, 64 tokens)
 
 ## Does this actually save VRAM?
 
-Everything above proves the mechanism doesn't break correctness. It doesn't yet show that it matters: with a 151-token prompt, the whole KV cache is a couple of MB, so paging it around is not solving any real memory problem. `bench/real_kv_vram_savings_proof_mvp.py` closes that gap by running at a context long enough for the KV cache itself to become a meaningful amount of memory, and measuring it directly.
+Everything above proves the mechanism doesn't break correctness. It doesn't yet show that it matters: with a 151-token prompt, the whole KV cache is a couple of MB, so paging it around is not solving any real memory problem. `bench/real_kv_vram_savings_proof_mvp.py` closes that gap by running at a context long enough for the KV cache itself to become a meaningful amount of memory, and measuring it directly (using the low-level `KVBlockStore`/`PyPager` primitives directly, the same way the earlier persistent-loop MVPs do).
 
 Two things had to be fixed to make that test possible, both worth knowing about if you push context length further:
 
@@ -451,7 +451,12 @@ This is still Qwen2.5-0.5B, which has only 2 KV heads (~12 KB of KV cache per to
 
 ## Python API: `pager_hf.PagedModel`
 
-All of the MVPs above are validation harnesses, not the intended way to use this project. `pager_hf` is a first cut at the real, installable interface: a thin wrapper around a HuggingFace causal LM that reuses the same Rust pager and KV block store, but without any of the debug printing or CLI plumbing.
+All of the other MVPs are validation harnesses, not the intended way to use this project. `pager_hf` is a first cut at the real, installable interface: a thin wrapper around a HuggingFace causal LM that reuses the same Rust pager and KV block store, but without any of the debug printing or CLI plumbing.
+
+`PagedModel` adapts itself to the chosen policy:
+
+- **`recent_only` / `sinks_recent`** — placement never uses attention scores (see `pager/src/core.rs`), so `PagedModel` skips `output_attentions` entirely and prefills in chunks. This is the path validated at long context in the section above — `bench/real_kv_paged_model_long_context_mvp.py` runs `PagedModel` itself (not the low-level primitives) at ~6,000 tokens and gets byte-identical output to baseline.
+- **`heavy_hitter` / `sinks_heavy_hitter`** — placement needs a real attention signal, so `output_attentions=True` (and eager attention) stays on during decoding. This is the path validated at short context by `bench/real_kv_paged_model_api_mvp.py`. It does not currently scale to long context (see "Does this actually save VRAM?" above) — that's real remaining work, not yet a solved problem.
 
 ```python
 import torch
@@ -460,7 +465,6 @@ from pager_hf import PagedModel
 
 model = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2.5-0.5B-Instruct",
-    attn_implementation="eager",
     torch_dtype=torch.float16,
 ).to("cuda")
 
@@ -471,7 +475,7 @@ paged_model = PagedModel(
     model,
     vram_budget=128_000_000,
     ram_budget=2_000_000_000,
-    policy="sinks_heavy_hitter",
+    policy="recent_only",  # use "sinks_heavy_hitter" for short, quality-sensitive contexts
 )
 
 generated_ids = paged_model.generate(
@@ -483,22 +487,61 @@ generated_ids = paged_model.generate(
 print(paged_model.last_run_stats)  # swap volume, attention kept on GPU, etc.
 ```
 
+### Persistence across `generate()` calls
+
+The KV block store and pager live on the `PagedModel` instance, not inside `generate()`. Each call is given the **full sequence so far** (previous input + previously generated tokens + any new tokens) and only the delta beyond what was already processed gets forward-passed — this is what makes a multi-turn session cheap instead of re-prefilling from scratch every turn:
+
+```python
+paged_model = PagedModel(model, vram_budget=128_000_000, ram_budget=2_000_000_000, policy="recent_only")
+
+turn1 = paged_model.generate(input_ids=ids1, attention_mask=mask1, max_new_tokens=64)
+
+# caller appends turn1's generated tokens + new user input, then continues
+ids2 = torch.cat([ids1, torch.tensor([turn1], device=ids1.device), new_turn_ids], dim=1)
+mask2 = torch.ones_like(ids2)
+turn2 = paged_model.generate(input_ids=ids2, attention_mask=mask2, max_new_tokens=64)
+
+paged_model.reset()  # drop the session; the next generate() call starts fresh
+```
+
+Passing a shorter `input_ids` than what's already primed, or one that diverges from the already-primed prefix, raises `ValueError` instead of silently corrupting the KV cache — `generate()` cannot "rewind" a session, only extend it or be `reset()`.
+
+### Batching (`batch_size > 1`)
+
+`generate()` accepts a real batch — one forward call per step across every row, not a Python loop — under two constraints:
+
+- **Same length, no padding.** Every row in the batch must have identical length; `attention_mask` must be all ones. Ragged/padded batches aren't supported yet.
+- **`recent_only` / `sinks_recent` only.** These policies place blocks purely by recency/position, so every row in an equal-length batch gets the *same* placement decision — one shared `PyPager` and one shared `KVBlockStore` (whose blocks now carry a batch dimension) is enough. `heavy_hitter` / `sinks_heavy_hitter` would need per-row placement and per-row attention extraction, neither of which exists yet; passing one of them with `batch_size > 1` raises `NotImplementedError` rather than silently doing something wrong.
+
+```python
+# input_ids/attention_mask: [batch_size, seq_len], all rows the same length
+generated = paged_model.generate(input_ids=batched_ids, attention_mask=batched_mask, max_new_tokens=64)
+# -> list[list[int]] when batch_size > 1 (list[int] when batch_size == 1, unchanged)
+```
+
+`bench/real_kv_paged_model_batch_mvp.py` proves this against the ground truth: three *different* prompts run together in one `batch_size=3` call produce, row for row, byte-identical output to running each prompt alone through `batch_size=1`.
+
 Install it (editable, alongside the Rust extension):
 
 ```bash
 pip install -e .
 ```
 
-`bench/real_kv_paged_model_api_mvp.py` validates that this API produces the exact same greedy generation as plain HuggingFace `transformers`, using the same prompt and policy as the other persistent MVPs:
+Validation:
 
 ```bash
-python bench/real_kv_paged_model_api_mvp.py
+python bench/real_kv_paged_model_api_mvp.py           # short context, sinks_heavy_hitter
+python bench/real_kv_paged_model_long_context_mvp.py  # long context, recent_only
+python bench/real_kv_paged_model_persistence_mvp.py   # split across generate() calls == single call
+python bench/real_kv_paged_model_batch_mvp.py         # batch_size > 1 == per-row batch_size == 1
 ```
 
 Current limitations of `pager_hf`:
 
-- Greedy decoding only, batch size 1.
-- Each `generate()` call starts a fresh KV store and pager (no cross-call persistence yet).
+- Greedy decoding only.
+- `batch_size > 1` requires equal-length rows (no padding) and `recent_only`/`sinks_recent`; ragged batches and attention-scored policies at batch>1 aren't supported.
+- New tokens beyond what's already primed are still fed through the model one at a time (matching how every other MVP in this project scores blocks per token); priming a very long new turn in one `generate()` call is not yet chunked the way the initial prefill is.
+- `heavy_hitter` / `sinks_heavy_hitter` still don't scale to long context — only the attention-free policies do today.
 - Same VRAM ↔ CPU-only scope as the rest of the project; no SSD tier, no vLLM/LMCache integration.
 
 ---
@@ -535,6 +578,9 @@ bench/
   real_kv_persistent_cpu_paging_stress_mvp.py
   real_kv_persistent_policy_compare_mvp.py
   real_kv_paged_model_api_mvp.py
+  real_kv_paged_model_long_context_mvp.py
+  real_kv_paged_model_persistence_mvp.py
+  real_kv_paged_model_batch_mvp.py
   real_kv_vram_savings_proof_mvp.py
 
 pager_hf/
@@ -542,6 +588,12 @@ pager_hf/
   kv_block_store.py  # runtime-agnostic GPU <-> CPU tensor movement primitive
   kv_utils.py         # HuggingFace past_key_values <-> KV block conversions
   paged_model.py      # PagedModel: the installable HF integration
+
+tests/
+  test_kv_utils.py    # CPU-only unit tests, run in CI
+
+.github/workflows/
+  ci.yml               # cargo test + pytest, no GPU needed
 
 pyproject.toml        # packaging for pager_hf (pip install -e .)
 ```
@@ -661,6 +713,29 @@ Expected final line:
 ```text
 OK: paged real Qwen KV loop produces identical greedy generation to baseline.
 ```
+
+---
+
+## Tests / CI
+
+There are two tiers of correctness check in this repo, and they run in different places on purpose:
+
+- **Automated, in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), no GPU needed:**
+  - `cargo test` — unit tests for the Rust pager core ([`pager/src/core.rs`](pager/src/core.rs)): policy placement, VRAM budget enforcement, sink/recent pinning, `force_rebalance`, metrics. Pure logic, deterministic, no tensors involved.
+  - `pytest tests/` — CPU-only unit tests for [`pager_hf/kv_utils.py`](pager_hf/kv_utils.py): the block extract/reconstruct round-trip (including the batch-dimension logic added for `batch_size > 1`), tail concatenation, and `past_key_values` normalization. These use plain CPU tensors and a fake block store, so they run on any GitHub-hosted runner.
+  - `python -m py_compile bench/*.py pager_hf/*.py` — catches syntax/import errors across everything else.
+- **Manual, local, real GPU + real model required:** every `bench/real_kv_*.py` script. These are the actual correctness and value proofs (`same_token_ids == True` against a real baseline, the VRAM savings numbers, batch/persistence equivalence) — they need CUDA and a downloaded model, so they don't run on free CI runners and aren't automated yet.
+
+Run the CI-equivalent checks locally:
+
+```bash
+cd pager && cargo test && cd ..
+pip install -e ".[dev]"
+python -m py_compile bench/*.py pager_hf/*.py
+python -m pytest tests/ -v
+```
+
+`pager_hf.KVBlockStore` itself is not unit-tested on CPU — it exists specifically to move tensors GPU ↔ CPU and rejects non-CUDA tensors by design, so exercising it for real is what the `bench/real_kv_*.py` scripts are for.
 
 ---
 
