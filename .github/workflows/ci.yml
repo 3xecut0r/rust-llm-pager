@@ -45,7 +45,9 @@ jobs:
           pip install transformers
           pip install -e . --no-deps
       - name: Build the Rust extension
-        run: maturin develop -m pager/Cargo.toml --release
+        run: |
+          maturin build -m pager/Cargo.toml --release
+          pip install pager/target/wheels/*.whl --no-deps
       - name: Byte-compile all Python sources
         run: python -m py_compile bench/*.py pager_hf/*.py
       - name: Run pytest
