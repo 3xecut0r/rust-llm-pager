@@ -165,6 +165,22 @@ generated_ids = paged_model.generate(
 print(paged_model.last_run_stats)  # swap volume, attention kept on GPU, etc.
 ```
 
+`generate()` is greedy by default — that's what every byte-identical-to-baseline check in this README relies on. Pass `do_sample=True` for temperature/top-k/top-p sampling instead:
+
+```python
+generated_ids = paged_model.generate(
+    input_ids=encoded["input_ids"],
+    attention_mask=encoded["attention_mask"],
+    max_new_tokens=64,
+    do_sample=True,
+    temperature=0.8,
+    top_p=0.9,
+    generator=torch.Generator(device="cuda").manual_seed(0),  # optional, for reproducibility
+)
+```
+
+`generator`, if given, has to be on the same device as the model — that's a PyTorch `multinomial` requirement, not something this project adds.
+
 ### Persistence across `generate()` calls
 
 The KV block store and pager live on the `PagedModel` instance, not inside `generate()`. Each call is given the full sequence so far — previous input, previously generated tokens, and any new tokens — and only the delta beyond what was already processed gets forward-passed. That's what makes a multi-turn session cheap instead of re-prefilling from scratch on every turn:
@@ -183,6 +199,8 @@ paged_model.reset()  # drop the session; the next generate() call starts fresh
 ```
 
 Pass a shorter `input_ids` than what's already primed, or one that diverges from the already-primed prefix, and you get a `ValueError` instead of a silently corrupted KV cache. `generate()` can extend a session or be reset — it can't rewind one.
+
+That mutable session state also means a single `PagedModel` instance isn't meant to serve two calls at once. Calling `generate()` or `reset()` on the same instance from another thread while one is already in flight raises `RuntimeError` immediately, instead of racing on `_store`/`_tail_past` and producing quietly wrong output. Use a separate `PagedModel` per concurrent session — they don't share any state.
 
 ### Batching (`batch_size > 1`)
 
@@ -213,8 +231,8 @@ python bench/real_kv_paged_model_batch_mvp.py         # batch_size > 1 == per-ro
 
 ### Current limitations of `pager_hf`
 
-- Greedy decoding only.
-- `batch_size > 1` needs left-padding to a common total length and `recent_only`/`sinks_recent`; right-padding, gapped masking, and attention-scored policies at `batch_size > 1` aren't supported.
+- Greedy by default; temperature/top-k/top-p sampling is available via `do_sample=True` (see the [Python API](#python-api-pager_hfpagedmodel) section above), but no beam search.
+- `batch_size > 1` needs left-padding to a common total length and `recent_only`/`sinks_recent`; right-padding, gapped masking, and attention-scored policies at `batch_size > 1` aren't supported. Left-padding is the standard way to batch causal-LM generation anyway, so this isn't considered a gap to close — see [Project stage](#project-stage).
 - New tokens beyond what's already primed get fed through the model one at a time (matching how every other script in this project scores blocks per token). Priming a very long new turn in one `generate()` call isn't chunked the way the initial prefill is.
 - Same VRAM ↔ CPU-only scope as the rest of the project — no SSD tier, no vLLM/LMCache integration.
 
@@ -472,10 +490,10 @@ This is a prototype, not a production inference backend.
 
 - Not integrated with vLLM or LMCache. Looked into what vLLM integration would actually take: its extension points (`KVConnectorBase_V1`, the pluggable `OffloadingManager`) are built for cross-request KV cache reuse — prefix caching, disaggregated prefill — not for the fine-grained, attention-driven, per-block placement within one active generation that this project does. vLLM's own memory management moves whole requests between GPU and CPU (or drops and recomputes them), not individual blocks of a live request. Worth knowing: vLLM's own CPU-offload roadmap plans round-robin then LRU eviction, not anything content-aware, so there's a real gap here — closing it would mean writing a vLLM-native plugin around this project's Rust core, not reusing `pager_hf` as-is. Parked for now, not abandoned.
 - HuggingFace forward still receives a reconstructed full GPU cache each step — there's no fused kernel doing partial reconstruction, so the reconstruction cost is real and scales with block count. First measured on `Qwen2.5-1.5B-Instruct` (8-bit, GTX 1050 Ti, 4GB): at 3,000 tokens the paged run's peak GPU memory during the forward pass (3,369 MB) was actually *higher* than the unpaged baseline's peak (3,242 MB), because both `reconstruct_past_from_store` and `append_tail_to_reconstructed_past` built fresh full-cache tensors by collecting copies in a list (or a second tensor) and `torch.cat`-ing them together — the whole cache resident twice at once, twice over. Rewriting both to write directly into one pre-allocated destination tensor — sized to include the tail up front, so `append_tail_to_reconstructed_past` isn't a separate step anymore — closed the gap almost entirely: paged peak dropped to 3,241.58 MB, 0.02 MB off the baseline's 3,241.56 MB. `same_token_ids: True` throughout, zero regressions across the full test suite and bench chain. This doesn't mean paged now fits a *longer* context than baseline — the underlying limit (every token must be in the attention computation for exact correctness) is unchanged, and the pager still only saves VRAM *between* generation steps, not the peak *during* one. What it fixes is paging no longer costing *more* peak memory than not paging at all. Going below baseline's peak needs incremental cache *growth* (skip rewriting blocks that didn't change) or a real paged-attention kernel (à la vLLM) — see [Project stage](#project-stage).
-- No SSD tier. Anything not on GPU currently lives in CPU RAM; a colder third tier isn't implemented.
+- No SSD tier. Anything not on GPU currently lives in CPU RAM; a colder third tier isn't implemented. `ram_budget` is enforced now: exceeding it raises `RuntimeError` with a clear message on the offload that would go over, instead of silently growing CPU RAM without limit (previously the Rust pager's logical "SSD" tier and its "RAM" tier were both just placed on CPU with no cap at all — `ram_budget` did nothing on the Python side). It's still a hard stop, not an SSD fallback: there's nowhere further to spill to yet.
 - Real-model demos originally used only `Qwen/Qwen2.5-0.5B-Instruct` (2 KV heads, tiny KV cache even at long context). Since validated on `TinyLlama-1.1B-Chat` (fp16) and `Qwen2.5-1.5B-Instruct` (8-bit via `bitsandbytes`) on an actual 4GB GTX 1050 Ti — both reproduce the same byte-identical output and 100% GPU-resident KV reduction between steps, but this is also what surfaced the peak-memory limitation above.
 - The Rust pager uses a fixed logical block size (16MiB) for its own placement math, independent of how large a real tensor block actually is; the Python side separately reports real tensor bytes moved. Documented, not a bug, but worth knowing if you're trying to reconcile the two sets of numbers.
-- Benchmarks so far prove correctness and mechanism, not production throughput or latency. Nothing here has been measured against a real serving workload.
+- `bench/real_kv_paged_model_throughput_mvp.py` measures steady-state decode speed: on `Qwen2.5-0.5B` (GTX 1050 Ti), paged decode runs about 1.17-1.18x slower per token than the unpaged baseline (2,000 tokens: 3.07 vs 2.63 tok/s; 5,922 tokens: 1.06 vs 0.91 tok/s) — the overhead doesn't visibly grow with context length in that range, so per-step reconstruction isn't a runaway cost. That's still just one small model on one weak GPU, not a production throughput/latency characterization, and nothing here has been measured against a real serving workload (concurrent requests, varied prompt lengths, a real scheduler).
 
 ---
 
@@ -489,7 +507,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 Research prototype, not production software.
 
-Current milestone: a real, installable API (`pager_hf.PagedModel`) that pages KV cache for any of the four policies, at both short and long context, with session persistence and batched generation — all checked byte-identical against an unpaged baseline, plus a Rust/Python test suite in CI.
+Current milestone: a real, installable API (`pager_hf.PagedModel`) that pages KV cache for any of the four policies, at both short and long context, with session persistence, batched generation, temperature/top-k/top-p sampling, an enforced `ram_budget`, and safe concurrent-call rejection — all checked byte-identical against an unpaged baseline (for the greedy default), plus a Rust/Python test suite in CI.
 
 Next: publish `rust-llm-pager-core` and `pager-hf` to PyPI — packaging is done and tested locally, just not uploaded yet.
 

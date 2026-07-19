@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -41,9 +42,10 @@ class GenerationStats:
 class PagedModel:
     # Wraps a HuggingFace causal LM so its KV cache is paged between GPU
     # and CPU memory by the Rust pager, instead of staying fully resident
-    # in VRAM. Greedy decoding only for now. See README for the full
-    # writeup on persistence across generate() calls, batching, and why
-    # long context works even for attention-scored policies.
+    # in VRAM. Greedy by default, sampling available via do_sample=True. A
+    # PagedModel instance holds one mutable session (see "Persistence across
+    # generate() calls" in the README), so generate()/reset() reject
+    # concurrent calls from another thread instead of racing on that state.
 
     def __init__(
         self,
@@ -63,6 +65,7 @@ class PagedModel:
         self.tokens_per_block = tokens_per_block
         self.prefill_chunk_tokens = prefill_chunk_tokens
         self._needs_attention = policy not in _POLICIES_WITHOUT_ATTENTION_SIGNAL
+        self._ram_budget = ram_budget
 
         self._pager_kwargs = dict(
             vram=vram_budget,
@@ -83,89 +86,165 @@ class PagedModel:
         self._tail_past = None
         self._primed_tokens = 0
         self._primed_prefix: torch.Tensor | None = None
+        self._lock = threading.Lock()
+
+    def _acquire_or_raise(self) -> None:
+        """Fail fast instead of silently racing when another call is already in flight."""
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Another generate() or reset() call is already running on this "
+                "PagedModel instance. It holds one mutable session, so concurrent "
+                "calls from another thread would corrupt its state rather than "
+                "run as independent requests. Use a separate PagedModel per "
+                "concurrent session, or synchronize calls to this one yourself."
+            )
 
     def reset(self) -> None:
         """Drop the current session; the next generate() call starts fresh."""
-        self._store = None
-        self._rust_pager = None
-        self._num_layers = None
-        self._num_blocks = None
-        self._tail_past = None
-        self._primed_tokens = 0
-        self._primed_prefix = None
+        self._acquire_or_raise()
+        try:
+            self._store = None
+            self._rust_pager = None
+            self._num_layers = None
+            self._num_blocks = None
+            self._tail_past = None
+            self._primed_tokens = 0
+            self._primed_prefix = None
+        finally:
+            self._lock.release()
 
     @torch.inference_mode()
     def generate(
-        self, input_ids: torch.Tensor, attention_mask: torch.Tensor, max_new_tokens: int
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_new_tokens: int,
+        *,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        generator: torch.Generator | None = None,
     ) -> list[int] | list[list[int]]:
-        """Generate up to max_new_tokens tokens, continuing any previous session on this model."""
-        device = input_ids.device
-        batch_size = input_ids.shape[0]
+        """
+        Generate up to max_new_tokens tokens, continuing any previous session on this model.
 
-        if batch_size > 1 and self._needs_attention:
-            raise NotImplementedError(
-                "batch_size > 1 is only supported for policies that don't "
-                "score blocks by attention (recent_only, sinks_recent), "
-                "since those are the only ones validated at batch>1 so far."
+        Greedy by default. Pass do_sample=True for temperature/top_k/top_p
+        sampling; generator, if given, must be on the same device as the model.
+        """
+        self._acquire_or_raise()
+        try:
+            device = input_ids.device
+            batch_size = input_ids.shape[0]
+
+            if batch_size > 1 and self._needs_attention:
+                raise NotImplementedError(
+                    "batch_size > 1 is only supported for policies that don't "
+                    "score blocks by attention (recent_only, sinks_recent), "
+                    "since those are the only ones validated at batch>1 so far."
+                )
+            self._validate_left_padded(attention_mask)
+
+            if do_sample:
+                if temperature <= 0:
+                    raise ValueError(f"temperature must be > 0 for sampling, got {temperature}.")
+                if top_k is not None and top_k < 1:
+                    raise ValueError(f"top_k must be >= 1, got {top_k}.")
+                if top_p is not None and not (0.0 < top_p <= 1.0):
+                    raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+
+            if self._store is None:
+                self._start_session(input_ids, attention_mask)
+            else:
+                self._extend_session(input_ids, attention_mask, device)
+
+            next_input_id = input_ids[:, -1:]
+            current_attention_mask = attention_mask
+
+            generated_per_row: list[list[int]] = [[] for _ in range(batch_size)]
+            stats = GenerationStats()
+            attention_in_gpu_values: list[float] = []
+
+            for _ in range(max_new_tokens):
+                outputs, step_stats = self._forward_step(next_input_id, current_attention_mask, device)
+
+                if do_sample:
+                    next_token_id = self._sample_next_token(
+                        outputs.logits[:, -1, :], temperature=temperature, top_k=top_k, top_p=top_p, generator=generator
+                    )
+                else:
+                    next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)  # [batch_size, 1]
+                for row_tokens, token_id in zip(generated_per_row, next_token_id[:, 0].tolist()):
+                    row_tokens.append(token_id)
+
+                stats.total_new_blocks += step_stats["new_blocks"]
+                stats.total_gpu_to_cpu_mb += step_stats["gpu_to_cpu_mb"]
+                stats.total_cpu_to_gpu_mb += step_stats["cpu_to_gpu_mb"]
+                stats.total_gpu_to_cpu_copies += step_stats["gpu_to_cpu_copies"]
+                stats.total_cpu_to_gpu_copies += step_stats["cpu_to_gpu_copies"]
+                attention_in_gpu_values.append(step_stats["attention_in_gpu"])
+
+                next_input_id = next_token_id
+                current_attention_mask = torch.cat(
+                    [
+                        current_attention_mask,
+                        torch.ones(
+                            (current_attention_mask.shape[0], 1),
+                            dtype=current_attention_mask.dtype,
+                            device=current_attention_mask.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+
+            # The very last token of (input_ids + generated) is only ever
+            # sampled, never forward-passed, so it's excluded from "primed".
+            full_sequence = torch.cat(
+                [input_ids, torch.tensor(generated_per_row, dtype=input_ids.dtype, device=input_ids.device)], dim=1
             )
-        self._validate_left_padded(attention_mask)
+            self._primed_prefix = full_sequence[:, :-1].detach().clone()
+            self._primed_tokens = full_sequence.shape[-1] - 1
 
-        if self._store is None:
-            self._start_session(input_ids, attention_mask)
-        else:
-            self._extend_session(input_ids, attention_mask, device)
+            stats.final_num_blocks = self._num_blocks
+            if attention_in_gpu_values:
+                stats.mean_attention_in_gpu = sum(attention_in_gpu_values) / len(attention_in_gpu_values)
+                stats.min_attention_in_gpu = min(attention_in_gpu_values)
+                stats.max_attention_in_gpu = max(attention_in_gpu_values)
 
-        next_input_id = input_ids[:, -1:]
-        current_attention_mask = attention_mask
+            self.last_run_stats = stats
 
-        generated_per_row: list[list[int]] = [[] for _ in range(batch_size)]
-        stats = GenerationStats()
-        attention_in_gpu_values: list[float] = []
+            return generated_per_row[0] if batch_size == 1 else generated_per_row
+        finally:
+            self._lock.release()
 
-        for _ in range(max_new_tokens):
-            outputs, step_stats = self._forward_step(next_input_id, current_attention_mask, device)
+    @staticmethod
+    def _sample_next_token(
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        top_k: int | None,
+        top_p: float | None,
+        generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """Sample one token per row from logits, after temperature/top-k/top-p filtering."""
+        logits = logits / temperature
 
-            next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)  # [batch_size, 1]
-            for row_tokens, token_id in zip(generated_per_row, next_token_id[:, 0].tolist()):
-                row_tokens.append(token_id)
+        if top_k is not None:
+            kth_value = torch.topk(logits, min(top_k, logits.shape[-1]), dim=-1).values[:, -1, None]
+            logits = logits.masked_fill(logits < kth_value, float("-inf"))
 
-            stats.total_new_blocks += step_stats["new_blocks"]
-            stats.total_gpu_to_cpu_mb += step_stats["gpu_to_cpu_mb"]
-            stats.total_cpu_to_gpu_mb += step_stats["cpu_to_gpu_mb"]
-            stats.total_gpu_to_cpu_copies += step_stats["gpu_to_cpu_copies"]
-            stats.total_cpu_to_gpu_copies += step_stats["cpu_to_gpu_copies"]
-            attention_in_gpu_values.append(step_stats["attention_in_gpu"])
+        if top_p is not None:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-            next_input_id = next_token_id
-            current_attention_mask = torch.cat(
-                [
-                    current_attention_mask,
-                    torch.ones(
-                        (current_attention_mask.shape[0], 1),
-                        dtype=current_attention_mask.dtype,
-                        device=current_attention_mask.device,
-                    ),
-                ],
-                dim=1,
-            )
+            # A token is outside the nucleus once the probability mass strictly
+            # before it already reaches top_p, so it isn't needed to hit top_p.
+            sorted_logits = sorted_logits.masked_fill(cumulative_probs - sorted_probs > top_p, float("-inf"))
+            logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_indices, sorted_logits)
 
-        # The very last token of (input_ids + generated) is only ever
-        # sampled, never forward-passed, so it's excluded from "primed".
-        full_sequence = torch.cat(
-            [input_ids, torch.tensor(generated_per_row, dtype=input_ids.dtype, device=input_ids.device)], dim=1
-        )
-        self._primed_prefix = full_sequence[:, :-1].detach().clone()
-        self._primed_tokens = full_sequence.shape[-1] - 1
-
-        stats.final_num_blocks = self._num_blocks
-        if attention_in_gpu_values:
-            stats.mean_attention_in_gpu = sum(attention_in_gpu_values) / len(attention_in_gpu_values)
-            stats.min_attention_in_gpu = min(attention_in_gpu_values)
-            stats.max_attention_in_gpu = max(attention_in_gpu_values)
-
-        self.last_run_stats = stats
-
-        return generated_per_row[0] if batch_size == 1 else generated_per_row
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1, generator=generator)
 
     def _start_session(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> None:
         """Prime the KV store and pager from scratch, using all but the last token as prefix."""
@@ -311,7 +390,7 @@ class PagedModel:
         full_past, tail_past, _ = split_full_blocks_and_tail(past_key_values, tokens_per_block=self.tokens_per_block)
         kv_blocks = real_past_to_blocks(full_past, tokens_per_block=self.tokens_per_block)
 
-        store = KVBlockStore(tokens_per_block=self.tokens_per_block)
+        store = KVBlockStore(tokens_per_block=self.tokens_per_block, ram_budget_bytes=self._ram_budget)
         for block_id, (key, value) in enumerate(kv_blocks):
             store.put_gpu(block_id, key, value)
 

@@ -30,11 +30,20 @@ class KVBlockStore:
     # between GPU and CPU memory. Knows nothing about HuggingFace, only
     # about (key, value) tensor pairs indexed by block id.
 
-    def __init__(self, tokens_per_block: int):
+    def __init__(self, tokens_per_block: int, ram_budget_bytes: int | None = None):
         self.tokens_per_block = tokens_per_block
+        self.ram_budget_bytes = ram_budget_bytes
 
         self.gpu_blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.cpu_blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # Kept in sync incrementally on every move, instead of summing over
+        # gpu_blocks/cpu_blocks on each call: apply_tiers can offload
+        # hundreds of blocks in a single step, and each offload checks
+        # ram_budget, so an O(n) resident-bytes scan per block would make
+        # that whole step O(n^2).
+        self._resident_gpu_bytes = 0
+        self._resident_cpu_bytes = 0
 
         self.stats = KVBlockStoreStats()
 
@@ -47,6 +56,7 @@ class KVBlockStore:
             raise ValueError(f"Block {block_id} already exists on CPU.")
 
         self.gpu_blocks[block_id] = (key.detach().contiguous(), value.detach().contiguous())
+        self._resident_gpu_bytes += kv_nbytes(key, value)
 
     def has_gpu(self, block_id: int) -> bool:
         return block_id in self.gpu_blocks
@@ -59,7 +69,23 @@ class KVBlockStore:
         if block_id not in self.gpu_blocks:
             raise KeyError(f"Block {block_id} is not on GPU.")
 
-        key, value = self.gpu_blocks.pop(block_id)
+        key, value = self.gpu_blocks[block_id]
+        incoming_bytes = kv_nbytes(key, value)
+
+        if self.ram_budget_bytes is not None:
+            projected_bytes = self._resident_cpu_bytes + incoming_bytes
+
+            if projected_bytes > self.ram_budget_bytes:
+                raise RuntimeError(
+                    f"ram_budget exceeded: moving block {block_id} to CPU would need "
+                    f"{projected_bytes / 1_000_000:.2f} MB, budget is "
+                    f"{self.ram_budget_bytes / 1_000_000:.2f} MB. There is no SSD tier "
+                    "yet, so overflow can't be absorbed further; use a shorter context, "
+                    "a larger ram_budget, or a bigger tokens_per_block."
+                )
+
+        del self.gpu_blocks[block_id]
+        self._resident_gpu_bytes -= incoming_bytes
 
         if key.is_cuda:
             torch.cuda.synchronize(key.device)
@@ -75,8 +101,9 @@ class KVBlockStore:
         torch.cuda.synchronize(key.device)
 
         self.cpu_blocks[block_id] = (cpu_key, cpu_value)
+        self._resident_cpu_bytes += incoming_bytes
 
-        self.stats.gpu_to_cpu_bytes += kv_nbytes(key, value)
+        self.stats.gpu_to_cpu_bytes += incoming_bytes
         self.stats.gpu_to_cpu_copies += 1
         self.stats.gpu_to_cpu_sec += started.elapsed_time(ended) / 1000.0
 
@@ -86,6 +113,8 @@ class KVBlockStore:
             raise KeyError(f"Block {block_id} is not on CPU.")
 
         key, value = self.cpu_blocks.pop(block_id)
+        incoming_bytes = kv_nbytes(key, value)
+        self._resident_cpu_bytes -= incoming_bytes
         device = torch.device(device)
 
         if device.type != "cuda":
@@ -104,8 +133,9 @@ class KVBlockStore:
         torch.cuda.synchronize(device)
 
         self.gpu_blocks[block_id] = (gpu_key, gpu_value)
+        self._resident_gpu_bytes += incoming_bytes
 
-        self.stats.cpu_to_gpu_bytes += kv_nbytes(key, value)
+        self.stats.cpu_to_gpu_bytes += incoming_bytes
         self.stats.cpu_to_gpu_copies += 1
         self.stats.cpu_to_gpu_sec += started.elapsed_time(ended) / 1000.0
 
@@ -124,10 +154,10 @@ class KVBlockStore:
         self.offload_to_cpu(block_id)
 
     def resident_gpu_bytes(self) -> int:
-        return sum(kv_nbytes(key, value) for key, value in self.gpu_blocks.values())
+        return self._resident_gpu_bytes
 
     def resident_cpu_bytes(self) -> int:
-        return sum(kv_nbytes(key, value) for key, value in self.cpu_blocks.values())
+        return self._resident_cpu_bytes
 
     def gpu_block_ids(self) -> list[int]:
         return sorted(self.gpu_blocks)
