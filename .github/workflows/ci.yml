@@ -40,9 +40,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install maturin and CPU-only dependencies
         run: |
-          pip install maturin
+          pip install maturin pytest black isort
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev]"
+          pip install transformers
+          pip install -e . --no-deps
       - name: Build the Rust extension
         run: maturin develop -m pager/Cargo.toml --release
       - name: Byte-compile all Python sources
@@ -67,5 +68,7 @@ jobs:
         run: pip wheel . --no-deps -w dist/
       - name: Install both wheels together and smoke-test the import
         run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers
           pip install pager/target/wheels/*.whl dist/*.whl --no-deps
           python -c "import pager; import pager_hf; pager.PyPager(128_000_000, 2_000_000_000, 64, 4, 0.05, 0.20, 'recent_only'); print('pager_hf.PagedModel:', pager_hf.PagedModel)"
