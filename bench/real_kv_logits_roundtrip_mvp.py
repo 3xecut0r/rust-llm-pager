@@ -1,37 +1,35 @@
 from __future__ import annotations
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.cache_utils import DynamicCache
-
-import pager
 from config import (
-    MODEL_NAME,
-    TOKENS_PER_BLOCK,
     MAX_LENGTH,
-    VRAM_BUDGET,
-    RAM_BUDGET,
-    RECENT_WINDOW,
-    REBALANCE_INTERVAL,
-    PROMOTE_MARGIN,
-    RAM_PROMOTE_MARGIN,
+    MODEL_NAME,
     POLICY,
+    PROMOTE_MARGIN,
+    RAM_BUDGET,
+    RAM_PROMOTE_MARGIN,
+    REBALANCE_INTERVAL,
+    RECENT_WINDOW,
+    TOKENS_PER_BLOCK,
+    VRAM_BUDGET,
 )
 from real_kv_utils import (
     build_prompt,
+    extract_last_query_block_attention,
     get_legacy_past_key_values,
     real_past_to_blocks,
-    extract_last_query_block_attention,
     reconstruct_past_from_store,
 )
 from torch_kv_block_store import KVBlockStore
 from torch_kv_offload_mvp import bytes_to_mb, print_summary
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
+
+import pager
 
 
-def compare_logits(
-        original_logits: torch.Tensor,
-        reconstructed_logits: torch.Tensor,
-) -> dict:
+def compare_logits(original_logits: torch.Tensor, reconstructed_logits: torch.Tensor) -> dict:
+    """Compare two logits tensors by max/mean absolute diff and whether their argmax agrees."""
     diff = torch.abs(original_logits - reconstructed_logits)
 
     original_argmax = int(torch.argmax(original_logits, dim=-1).item())
@@ -62,22 +60,15 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
-    ).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation="eager", torch_dtype=torch.float16).to(
+        device
+    )
 
     model.eval()
 
     prompt = build_prompt()
 
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_LENGTH,
-    )
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
 
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
@@ -85,19 +76,11 @@ def main() -> None:
     print("prompt_seq_len:", input_ids.shape[-1])
 
     with torch.inference_mode():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=True,
-            output_attentions=True,
-        )
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True, output_attentions=True)
 
     original_past = get_legacy_past_key_values(outputs)
 
-    kv_blocks = real_past_to_blocks(
-        original_past,
-        tokens_per_block=TOKENS_PER_BLOCK,
-    )
+    kv_blocks = real_past_to_blocks(original_past, tokens_per_block=TOKENS_PER_BLOCK)
 
     num_blocks = len(kv_blocks)
     num_layers = len(original_past)
@@ -116,27 +99,18 @@ def main() -> None:
     print_summary("After real KV block extraction", store)
 
     p = pager.PyPager(
-        VRAM_BUDGET,
-        RAM_BUDGET,
-        RECENT_WINDOW,
-        REBALANCE_INTERVAL,
-        PROMOTE_MARGIN,
-        RAM_PROMOTE_MARGIN,
-        POLICY,
+        VRAM_BUDGET, RAM_BUDGET, RECENT_WINDOW, REBALANCE_INTERVAL, PROMOTE_MARGIN, RAM_PROMOTE_MARGIN, POLICY
     )
 
     block_attention = extract_last_query_block_attention(
-        outputs,
-        tokens_per_block=TOKENS_PER_BLOCK,
-        num_blocks=num_blocks,
+        outputs, tokens_per_block=TOKENS_PER_BLOCK, num_blocks=num_blocks
     )
 
     query_block = num_blocks - 1
 
     p.on_step(query_block, 0, block_attention)
 
-    tiers = p.tiers()
-    movement = store.apply_tiers(tiers, device)
+    movement = store.apply_tiers(p.tiers(), device)
 
     print_summary("After Rust pager offload placement", store)
     print("moved_to_cpu:", movement["to_cpu"])
@@ -147,20 +121,13 @@ def main() -> None:
     for block_id in range(num_blocks):
         store.ensure_gpu(block_id, device)
 
-    reconstructed_past = reconstruct_past_from_store(
-        store=store,
-        num_layers=num_layers,
-        num_blocks=num_blocks,
-    )
+    reconstructed_past = reconstruct_past_from_store(store=store, num_layers=num_layers, num_blocks=num_blocks)
 
     print_summary("After reloading all blocks for logits test", store)
 
     # We only reconstructed full blocks.
     # So compare logits using the next token after the reconstructed prefix.
-    prefix_input_ids = input_ids[:, :full_tokens]
-    prefix_attention_mask = attention_mask[:, :full_tokens]
-
-    next_input_id = input_ids[:, full_tokens:full_tokens + 1]
+    next_input_id = input_ids[:, full_tokens : full_tokens + 1]
 
     if next_input_id.shape[-1] != 1:
         raise RuntimeError("No next token available after reconstructed prefix.")
@@ -170,28 +137,18 @@ def main() -> None:
 
     for key, value in original_past:
         original_trimmed_past.append(
-            (
-                key[:, :, :full_tokens, :].contiguous(),
-                value[:, :, :full_tokens, :].contiguous(),
-            )
+            (key[:, :, :full_tokens, :].contiguous(), value[:, :, :full_tokens, :].contiguous())
         )
 
     # Attention mask for prefix + one next token.
-    next_attention_mask = attention_mask[:, :full_tokens + 1]
+    next_attention_mask = attention_mask[:, : full_tokens + 1]
 
-    original_cache = DynamicCache.from_legacy_cache(
-        tuple(original_trimmed_past)
-    )
-    reconstructed_cache = DynamicCache.from_legacy_cache(
-        tuple(reconstructed_past)
-    )
+    original_cache = DynamicCache.from_legacy_cache(tuple(original_trimmed_past))
+    reconstructed_cache = DynamicCache.from_legacy_cache(tuple(reconstructed_past))
 
     with torch.inference_mode():
         original_next = model(
-            input_ids=next_input_id,
-            attention_mask=next_attention_mask,
-            past_key_values=original_cache,
-            use_cache=False,
+            input_ids=next_input_id, attention_mask=next_attention_mask, past_key_values=original_cache, use_cache=False
         )
 
         reconstructed_next = model(
@@ -204,24 +161,18 @@ def main() -> None:
     original_logits = original_next.logits[:, -1, :]
     reconstructed_logits = reconstructed_next.logits[:, -1, :]
 
-    comparison = compare_logits(
-        original_logits=original_logits,
-        reconstructed_logits=reconstructed_logits,
-    )
-
-    original_token = tokenizer.decode([comparison["original_argmax"]])
-    reconstructed_token = tokenizer.decode([comparison["reconstructed_argmax"]])
+    comparison = compare_logits(original_logits=original_logits, reconstructed_logits=reconstructed_logits)
 
     print("\nLogits roundtrip comparison")
     print("---------------------------")
     print("max_logits_diff:", comparison["max_logits_diff"])
     print("mean_logits_diff:", comparison["mean_logits_diff"])
     print("same_argmax:", comparison["same_argmax"])
-    print("original_argmax:", comparison["original_argmax"], repr(original_token))
+    print("original_argmax:", comparison["original_argmax"], repr(tokenizer.decode([comparison["original_argmax"]])))
     print(
         "reconstructed_argmax:",
         comparison["reconstructed_argmax"],
-        repr(reconstructed_token),
+        repr(tokenizer.decode([comparison["reconstructed_argmax"]])),
     )
 
     assert comparison["max_logits_diff"] == 0.0

@@ -1,38 +1,37 @@
 from __future__ import annotations
 
 import torch
+from config import (
+    GENERATE_TOKENS,
+    MAX_LENGTH,
+    MODEL_NAME,
+    POLICY,
+    PROMOTE_MARGIN,
+    RAM_BUDGET,
+    RAM_PROMOTE_MARGIN,
+    REBALANCE_INTERVAL,
+    RECENT_WINDOW,
+    TOKENS_PER_BLOCK,
+    VRAM_BUDGET,
+)
+from real_kv_utils import (
+    build_prompt,
+    extract_last_query_block_attention,
+    format_block_list,
+    get_legacy_past_key_values,
+    real_past_to_blocks,
+    reconstruct_past_from_store,
+    split_full_blocks_and_tail,
+)
+from torch_kv_block_store import KVBlockStore
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import pager
-from config import (
-    MODEL_NAME,
-    TOKENS_PER_BLOCK,
-    MAX_LENGTH,
-    VRAM_BUDGET,
-    RAM_BUDGET,
-    RECENT_WINDOW,
-    REBALANCE_INTERVAL,
-    PROMOTE_MARGIN,
-    RAM_PROMOTE_MARGIN,
-    POLICY,
-    GENERATE_TOKENS,
-)
-from real_kv_utils import (
-    build_prompt,
-    get_legacy_past_key_values,
-    real_past_to_blocks,
-    extract_last_query_block_attention,
-    split_full_blocks_and_tail,
-    append_tail_to_reconstructed_past,
-    reconstruct_past_from_store,
-    format_block_list,
-)
-from torch_kv_block_store import KVBlockStore
 
 
 def rebuild_store_from_past(
-        past_key_values,
+    past_key_values,
 ) -> tuple[KVBlockStore, int, int, list[tuple[torch.Tensor, torch.Tensor]], int]:
     """
     Convert only full KV blocks into KVBlockStore.
@@ -40,15 +39,9 @@ def rebuild_store_from_past(
     Tail tokens that do not fill a complete block are returned separately
     and appended back before the next model forward.
     """
-    full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-        past_key_values,
-        tokens_per_block=TOKENS_PER_BLOCK,
-    )
+    full_past, tail_past, full_tokens = split_full_blocks_and_tail(past_key_values, tokens_per_block=TOKENS_PER_BLOCK)
 
-    kv_blocks = real_past_to_blocks(
-        full_past,
-        tokens_per_block=TOKENS_PER_BLOCK,
-    )
+    kv_blocks = real_past_to_blocks(full_past, tokens_per_block=TOKENS_PER_BLOCK)
 
     store = KVBlockStore(tokens_per_block=TOKENS_PER_BLOCK)
 
@@ -62,24 +55,15 @@ def rebuild_store_from_past(
 
 
 def apply_pager_to_store(
-        *,
-        p: pager.PyPager,
-        store: KVBlockStore,
-        block_attention: list[float],
-        query_block: int,
-        device: torch.device,
+    *, p: pager.PyPager, store: KVBlockStore, block_attention: list[float], query_block: int, device: torch.device
 ) -> dict[str, list[int]]:
+    """Score the query block, let the pager rebalance, and apply the resulting tiers."""
     p.on_step(query_block, 0, block_attention)
-    tiers = p.tiers()
-    return store.apply_tiers(tiers, device)
+    return store.apply_tiers(p.tiers(), device)
 
 
-def reload_all_blocks(
-        *,
-        store: KVBlockStore,
-        num_blocks: int,
-        device: torch.device,
-) -> None:
+def reload_all_blocks(*, store: KVBlockStore, num_blocks: int, device: torch.device) -> None:
+    """Make sure every block is back on GPU before the next forward pass."""
     for block_id in range(num_blocks):
         store.ensure_gpu(block_id, device)
 
@@ -101,22 +85,15 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
-    ).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, attn_implementation="eager", torch_dtype=torch.float16).to(
+        device
+    )
 
     model.eval()
 
     prompt = build_prompt()
 
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_LENGTH,
-    )
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
 
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
@@ -126,36 +103,22 @@ def main() -> None:
     # Build cache for prompt[:-1], then feed prompt[-1] as the first decode input.
     # This makes step 1 generate the first token after the full prompt.
     prefix_input_ids = input_ids[:, :-1]
-    prefix_attention_mask = attention_mask[:, :-1]
 
     next_input_id = input_ids[:, -1:]
     current_attention_mask = attention_mask
 
     with torch.inference_mode():
         outputs = model(
-            input_ids=prefix_input_ids,
-            attention_mask=prefix_attention_mask,
-            use_cache=True,
-            output_attentions=True,
+            input_ids=prefix_input_ids, attention_mask=attention_mask[:, :-1], use_cache=True, output_attentions=True
         )
 
     current_past = get_legacy_past_key_values(outputs)
 
     print("initial_cache_tokens:", prefix_input_ids.shape[-1])
-    print(
-        "initial_next_input_id:",
-        int(next_input_id.item()),
-        repr(tokenizer.decode(next_input_id[0])),
-    )
+    print("initial_next_input_id:", int(next_input_id.item()), repr(tokenizer.decode(next_input_id[0])))
 
     p = pager.PyPager(
-        VRAM_BUDGET,
-        RAM_BUDGET,
-        RECENT_WINDOW,
-        REBALANCE_INTERVAL,
-        PROMOTE_MARGIN,
-        RAM_PROMOTE_MARGIN,
-        POLICY,
+        VRAM_BUDGET, RAM_BUDGET, RECENT_WINDOW, REBALANCE_INTERVAL, PROMOTE_MARGIN, RAM_PROMOTE_MARGIN, POLICY
     )
 
     generated: list[int] = []
@@ -166,39 +129,22 @@ def main() -> None:
     total_cpu_to_gpu_copies = 0
 
     for step in range(1, GENERATE_TOKENS + 1):
-        store, num_layers, num_blocks, tail_past, full_tokens = rebuild_store_from_past(
-            current_past
-        )
-
-        tail_tokens = tail_past[0][0].shape[2]
+        store, num_layers, num_blocks, tail_past, full_tokens = rebuild_store_from_past(current_past)
 
         block_attention = extract_last_query_block_attention(
-            outputs,
-            tokens_per_block=TOKENS_PER_BLOCK,
-            num_blocks=num_blocks,
+            outputs, tokens_per_block=TOKENS_PER_BLOCK, num_blocks=num_blocks
         )
 
         query_block = num_blocks - 1
 
         movement = apply_pager_to_store(
-            p=p,
-            store=store,
-            block_attention=block_attention,
-            query_block=query_block,
-            device=device,
+            p=p, store=store, block_attention=block_attention, query_block=query_block, device=device
         )
 
         summary_after_offload = store.summary()
 
-        cpu_to_gpu_before_reload = summary_after_offload["cpu_to_gpu_bytes"]
-        cpu_to_gpu_copies_before_reload = summary_after_offload[
-            "cpu_to_gpu_copies"
-        ]
-
         real_attention_in_gpu = sum(
-            block_attention[block_id]
-            for block_id in store.gpu_block_ids()
-            if block_id < len(block_attention)
+            block_attention[block_id] for block_id in store.gpu_block_ids() if block_id < len(block_attention)
         )
 
         print(f"\nPaged generation step {step}")
@@ -206,27 +152,17 @@ def main() -> None:
         print("num_blocks:", num_blocks)
         print("query_block:", query_block)
         print("full_tokens:", full_tokens)
-        print("tail_tokens:", tail_tokens)
+        print("tail_tokens:", tail_past[0][0].shape[2])
         print("moved_to_cpu:", format_block_list(movement["to_cpu"]))
         print("moved_to_gpu:", format_block_list(movement["to_gpu"]))
         print("pager_vram_blocks:", format_block_list(p.vram_block_ids()))
         print("store_gpu_blocks:", format_block_list(store.gpu_block_ids()))
         print("real_attention_in_gpu:", f"{real_attention_in_gpu:.4f}")
-        print(
-            "resident_gpu_mb_after_offload:",
-            f"{summary_after_offload['resident_gpu_bytes'] / 1_000_000:.2f}",
-        )
-        print(
-            "resident_cpu_mb_after_offload:",
-            f"{summary_after_offload['resident_cpu_bytes'] / 1_000_000:.2f}",
-        )
+        print("resident_gpu_mb_after_offload:", f"{summary_after_offload['resident_gpu_bytes'] / 1_000_000:.2f}")
+        print("resident_cpu_mb_after_offload:", f"{summary_after_offload['resident_cpu_bytes'] / 1_000_000:.2f}")
 
         # HF forward still requires full GPU KV, so reload all blocks before reconstructing.
-        reload_all_blocks(
-            store=store,
-            num_blocks=num_blocks,
-            device=device,
-        )
+        reload_all_blocks(store=store, num_blocks=num_blocks, device=device)
 
         summary_after_reload = store.summary()
 
@@ -235,25 +171,15 @@ def main() -> None:
         total_gpu_to_cpu_copies += summary_after_reload["gpu_to_cpu_copies"]
         total_cpu_to_gpu_copies += summary_after_reload["cpu_to_gpu_copies"]
 
-        step_cpu_to_gpu_mb = (
-            summary_after_reload["cpu_to_gpu_bytes"] - cpu_to_gpu_before_reload
-        ) / 1_000_000
-        step_cpu_to_gpu_copies = (
-            summary_after_reload["cpu_to_gpu_copies"]
-            - cpu_to_gpu_copies_before_reload
-        )
-        print("cpu_to_gpu_reload_mb:", f"{step_cpu_to_gpu_mb:.2f}")
-        print("cpu_to_gpu_reload_copies:", step_cpu_to_gpu_copies)
-
-        reconstructed_full_past = reconstruct_past_from_store(
-            store=store,
-            num_layers=num_layers,
-            num_blocks=num_blocks,
+        step_cpu_to_gpu_bytes = summary_after_reload["cpu_to_gpu_bytes"] - summary_after_offload["cpu_to_gpu_bytes"]
+        print("cpu_to_gpu_reload_mb:", f"{step_cpu_to_gpu_bytes / 1_000_000:.2f}")
+        print(
+            "cpu_to_gpu_reload_copies:",
+            summary_after_reload["cpu_to_gpu_copies"] - summary_after_offload["cpu_to_gpu_copies"],
         )
 
-        current_past = append_tail_to_reconstructed_past(
-            reconstructed_full_past,
-            tail_past,
+        current_past = reconstruct_past_from_store(
+            store=store, num_layers=num_layers, num_blocks=num_blocks, tail_past=tail_past
         )
 
         cache = DynamicCache.from_legacy_cache(tuple(current_past))
@@ -267,9 +193,7 @@ def main() -> None:
                 output_attentions=True,
             )
 
-        logits = outputs.logits[:, -1, :]
-        generated_token = torch.argmax(logits, dim=-1, keepdim=True)
-
+        generated_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         token_id = int(generated_token.item())
         generated.append(token_id)
 
@@ -291,12 +215,10 @@ def main() -> None:
             dim=1,
         )
 
-    generated_text = tokenizer.decode(generated)
-
     print("\nPaged generation loop summary")
     print("-----------------------------")
     print("generated_ids:", generated)
-    print("generated_text:", repr(generated_text))
+    print("generated_text:", repr(tokenizer.decode(generated)))
     print("total_gpu_to_cpu_mb:", f"{total_gpu_to_cpu_mb:.2f}")
     print("total_cpu_to_gpu_mb:", f"{total_cpu_to_gpu_mb:.2f}")
     print("total_gpu_to_cpu_copies:", total_gpu_to_cpu_copies)

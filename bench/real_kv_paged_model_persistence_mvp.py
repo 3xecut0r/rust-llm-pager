@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import torch
+from config import MODEL_NAME, RAM_BUDGET, RECENT_WINDOW, TOKENS_PER_BLOCK, VRAM_BUDGET
+from real_kv_utils import build_prompt
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import MODEL_NAME, TOKENS_PER_BLOCK, VRAM_BUDGET, RAM_BUDGET, RECENT_WINDOW
-from real_kv_utils import build_prompt
 from pager_hf import PagedModel
 
 POLICY = "recent_only"
@@ -26,10 +26,7 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
-    ).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to(device)
     model.eval()
 
     prompt = build_prompt()
@@ -51,9 +48,7 @@ def main() -> None:
     print("\nRunning single-call generate() (one shot, no persistence needed)...")
     single_call_model = PagedModel(model, **pager_kwargs)
     single_call_generated = single_call_model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=GENERATE_TOKENS,
+        input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=GENERATE_TOKENS
     )
 
     # ---- Split across two calls: prime half the prompt first (no
@@ -65,14 +60,10 @@ def main() -> None:
 
     persistent_model = PagedModel(model, **pager_kwargs)
     persistent_model.generate(
-        input_ids=input_ids[:, :split_point],
-        attention_mask=attention_mask[:, :split_point],
-        max_new_tokens=0,
+        input_ids=input_ids[:, :split_point], attention_mask=attention_mask[:, :split_point], max_new_tokens=0
     )
     split_call_generated = persistent_model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=GENERATE_TOKENS,
+        input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=GENERATE_TOKENS
     )
 
     print("\nPersistence summary")
@@ -86,25 +77,13 @@ def main() -> None:
     # ---- Safety checks: reset() and prefix-mismatch/rewind must be caught ----
     print("\nChecking reset() and misuse guards...")
     persistent_model.reset()
-    persistent_model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=1,
-    )
+    persistent_model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=1)
     print("reset() + fresh generate(): OK")
 
     diverged_model = PagedModel(model, **pager_kwargs)
-    diverged_model.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=4,
-    )
+    diverged_model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4)
     try:
-        diverged_model.generate(
-            input_ids=input_ids[:, :5],
-            attention_mask=attention_mask[:, :5],
-            max_new_tokens=1,
-        )
+        diverged_model.generate(input_ids=input_ids[:, :5], attention_mask=attention_mask[:, :5], max_new_tokens=1)
     except ValueError as exc:
         print("rewind correctly rejected:", str(exc)[:80])
     else:

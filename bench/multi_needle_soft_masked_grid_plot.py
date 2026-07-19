@@ -1,30 +1,23 @@
 from pathlib import Path
 
-import pandas as pd
 import matplotlib.pyplot as plt
-
+import pandas as pd
 
 RESULTS_PATH = Path("bench/multi_needle_soft_masked_grid_results.csv")
 PLOTS_DIR = Path("bench/plots")
 
 
 def main():
+    """Render win-rate and perplexity charts from the multi-needle grid results CSV."""
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(RESULTS_PATH)
     policies = df[df["policy"] != "full_context"].copy()
 
-    setting_cols = [
-        "needle_id",
-        "ram_attention_penalty",
-        "ssd_attention_penalty",
-    ]
+    setting_cols = ["needle_id", "ram_attention_penalty", "ssd_attention_penalty"]
 
     winners = (
-        policies.sort_values(
-            setting_cols + ["perplexity"],
-            ascending=[True, True, True, True],
-            )
+        policies.sort_values(setting_cols + ["perplexity"], ascending=[True, True, True, True])
         .groupby(setting_cols, as_index=False)
         .first()
     )
@@ -82,10 +75,7 @@ def main():
     strong = policies[policies["ssd_attention_penalty"] <= -6.0].copy()
 
     strong_winners = (
-        strong.sort_values(
-            setting_cols + ["perplexity"],
-            ascending=[True, True, True, True],
-            )
+        strong.sort_values(setting_cols + ["perplexity"], ascending=[True, True, True, True])
         .groupby(setting_cols, as_index=False)
         .first()
     )
@@ -104,11 +94,7 @@ def main():
     plt.savefig(out_path, dpi=160, bbox_inches="tight")
     print(f"Saved: {out_path}")
 
-    by_needle = (
-        winners.groupby(["needle_id", "policy"])
-        .size()
-        .unstack(fill_value=0)
-    )
+    by_needle = winners.groupby(["needle_id", "policy"]).size().unstack(fill_value=0)
 
     ax = by_needle.plot(kind="bar", figsize=(11, 6))
     ax.set_xlabel("Needle")
@@ -124,4 +110,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

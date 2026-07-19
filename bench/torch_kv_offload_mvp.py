@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import torch
-
 from torch_kv_block_store import KVBlockStore
-
 
 TOKENS_PER_BLOCK = 16
 
@@ -16,20 +14,16 @@ DTYPE = torch.float16
 
 
 def make_dummy_kv_block(
-        *,
-        device: torch.device,
-        tokens_per_block: int,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
+    *,
+    device: torch.device,
+    tokens_per_block: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    shape = (
-        num_layers,
-        tokens_per_block,
-        num_kv_heads,
-        head_dim,
-    )
+    """Build a random KV-shaped tensor pair standing in for a real model block."""
+    shape = (num_layers, tokens_per_block, num_kv_heads, head_dim)
 
     key = torch.randn(shape, device=device, dtype=dtype)
     value = torch.randn(shape, device=device, dtype=dtype)
@@ -42,6 +36,7 @@ def bytes_to_mb(value: int) -> float:
 
 
 def print_summary(title: str, store: KVBlockStore) -> None:
+    """Print the store's resident-memory and transfer stats under a heading."""
     summary = store.summary()
 
     print(f"\n{title}")
@@ -114,4 +109,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    

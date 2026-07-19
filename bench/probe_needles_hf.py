@@ -5,7 +5,6 @@ from textwrap import dedent
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 
 MAX_LENGTH = 256
@@ -37,7 +36,6 @@ CANDIDATES = [
         "fact": "The emergency recovery phrase is BLACK RIVER.",
         "question": "What is the emergency recovery phrase mentioned at the beginning?",
     },
-
     {
         "needle_id": "golden_tiger",
         "answer": "GOLDEN TIGER",
@@ -72,13 +70,10 @@ CANDIDATES = [
 
 
 def build_needle_prompt(needle: dict) -> str:
-    needle_text = (
-        f"IMPORTANT FACT: {needle['fact']} "
-        "Remember this value because it will be asked later."
-    )
+    """Build a needle-in-a-haystack prompt for a single candidate fact."""
+    needle_text = f"IMPORTANT FACT: {needle['fact']} Remember this value because it will be asked later."
 
-    filler_unit = dedent(
-        """
+    filler = dedent("""
         This paragraph is unrelated filler text about software engineering,
         memory management, operating systems, compilers, databases, networking,
         and performance optimization. It mentions Rust, Python, Linux, GPUs,
@@ -90,28 +85,16 @@ def build_needle_prompt(needle: dict) -> str:
         memory usage, and reason about trade-offs between throughput and quality.
         This paragraph is intentionally noisy and should distract attention from
         the important fact at the beginning.
-        """
-    ).strip()
+        """).strip()
 
-    filler = "\n\n".join([filler_unit for _ in range(1)])
-
-    question = (
-        f"Question: {needle['question']}\n"
-        "Answer:"
-    )
-
-    return "\n\n".join([needle_text, filler, question])
+    return "\n\n".join([needle_text, filler, f"Question: {needle['question']}\nAnswer:"])
 
 
 def generate_answer(model, tokenizer, prompt: str) -> str:
+    """Greedily decode MAX_NEW_TOKENS tokens for a single prompt, no KV paging."""
     device = next(model.parameters()).device
 
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_LENGTH,
-    )
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
 
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
@@ -120,30 +103,24 @@ def generate_answer(model, tokenizer, prompt: str) -> str:
 
     with torch.inference_mode():
         for _ in range(MAX_NEW_TOKENS):
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
 
-            logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
 
             generated_ids.append(int(next_token.item()))
 
             input_ids = torch.cat([input_ids, next_token], dim=-1)
 
-            next_mask = torch.ones(
-                (attention_mask.shape[0], 1),
-                dtype=attention_mask.dtype,
-                device=device,
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)],
+                dim=-1,
             )
-            attention_mask = torch.cat([attention_mask, next_mask], dim=-1)
 
     return tokenizer.decode(generated_ids, skip_special_tokens=True)
 
 
 def main():
+    """Run every needle candidate through the model and report which ones the model recalls."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print("device:", device)
@@ -155,9 +132,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        attn_implementation="eager",
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        MODEL_NAME, attn_implementation="eager", torch_dtype=torch.float16 if device == "cuda" else torch.float32
     ).to(device)
 
     model.eval()
@@ -167,17 +142,7 @@ def main():
     for needle in CANDIDATES:
         prompt = build_needle_prompt(needle)
 
-        tokenized = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=MAX_LENGTH,
-        )
-
-        decoded_prompt = tokenizer.decode(
-            tokenized["input_ids"][0],
-            skip_special_tokens=True,
-        )
+        tokenized = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
 
         generated = generate_answer(model, tokenizer, prompt)
 
@@ -198,11 +163,8 @@ def main():
 
     print("\nGood needles:")
     for needle in good:
-        print(
-            f"- {needle['needle_id']}: {needle['answer']}"
-        )
+        print(f"- {needle['needle_id']}: {needle['answer']}")
 
 
 if __name__ == "__main__":
     main()
-    

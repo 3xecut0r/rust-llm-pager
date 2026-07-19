@@ -3,30 +3,29 @@ from __future__ import annotations
 import argparse
 
 import torch
+from config import (
+    MODEL_NAME,
+    PROMOTE_MARGIN,
+    RAM_BUDGET,
+    RAM_PROMOTE_MARGIN,
+    REBALANCE_INTERVAL,
+    RECENT_WINDOW,
+    TOKENS_PER_BLOCK,
+    VRAM_BUDGET,
+)
+from real_kv_utils import (
+    extract_single_block_from_past,
+    format_block_list,
+    get_legacy_past_key_values,
+    real_past_to_blocks,
+    reconstruct_past_from_store,
+    split_full_blocks_and_tail,
+)
+from torch_kv_block_store import KVBlockStore
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import pager
-from config import (
-    MODEL_NAME,
-    TOKENS_PER_BLOCK,
-    VRAM_BUDGET,
-    RAM_BUDGET,
-    RECENT_WINDOW,
-    REBALANCE_INTERVAL,
-    PROMOTE_MARGIN,
-    RAM_PROMOTE_MARGIN,
-)
-from real_kv_utils import (
-    get_legacy_past_key_values,
-    split_full_blocks_and_tail,
-    append_tail_to_reconstructed_past,
-    reconstruct_past_from_store,
-    extract_single_block_from_past,
-    real_past_to_blocks,
-    format_block_list,
-)
-from torch_kv_block_store import KVBlockStore
 
 # This proof uses recent_only: placement here does not depend on attention
 # scores, so we can skip output_attentions=True entirely and avoid the
@@ -40,6 +39,7 @@ PREFILL_CHUNK = 512
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse --context-tokens, --new-tokens, and --vram-budget-mb."""
     parser = argparse.ArgumentParser(
         description=(
             "Prove real VRAM savings: how much real Qwen KV cache the pager "
@@ -59,6 +59,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_long_prompt(tokenizer, target_tokens: int) -> str:
+    """Repeat a filler paragraph until it tokenizes to at least target_tokens."""
     paragraph = (
         "The quick brown fox jumps over the lazy dog while researchers discuss "
         "memory management, operating systems, distributed caches, and GPU "
@@ -97,42 +98,30 @@ def chunked_prefill(model, prefix_input_ids, prefix_attention_mask, chunk_size):
     return outputs
 
 
-def append_new_full_blocks_if_needed(
-        *,
-        store: KVBlockStore,
-        past_key_values,
-        known_num_blocks: int,
-):
-    full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-        past_key_values,
-        tokens_per_block=TOKENS_PER_BLOCK,
-    )
-
+def append_new_full_blocks_if_needed(*, store: KVBlockStore, past_key_values, known_num_blocks: int):
+    """Register any newly completed KV blocks in the store."""
+    full_past, tail_past, full_tokens = split_full_blocks_and_tail(past_key_values, tokens_per_block=TOKENS_PER_BLOCK)
     new_num_blocks = full_tokens // TOKENS_PER_BLOCK
-    added_block_ids: list[int] = []
 
-    if new_num_blocks > known_num_blocks:
-        for block_id in range(known_num_blocks, new_num_blocks):
-            key, value = extract_single_block_from_past(
-                full_past,
-                block_id=block_id,
-                tokens_per_block=TOKENS_PER_BLOCK,
-            )
-            store.put_gpu(block_id, key, value)
-            added_block_ids.append(block_id)
+    added_block_ids = list(range(known_num_blocks, new_num_blocks))
+    for block_id in added_block_ids:
+        store.put_gpu(
+            block_id, *extract_single_block_from_past(full_past, block_id=block_id, tokens_per_block=TOKENS_PER_BLOCK)
+        )
 
     return new_num_blocks, tail_past, added_block_ids
 
 
 def reload_all_blocks_for_forward(store: KVBlockStore, device, num_blocks: int) -> None:
+    """Make sure every block is back on GPU before the next forward pass."""
     for block_id in range(num_blocks):
         store.ensure_gpu(block_id, device)
 
 
 def kv_cache_nbytes(past_key_values) -> int:
+    """Return the total byte size of a legacy past_key_values structure."""
     return sum(
-        key.numel() * key.element_size() + value.numel() * value.element_size()
-        for key, value in past_key_values
+        key.numel() * key.element_size() + value.numel() * value.element_size() for key, value in past_key_values
     )
 
 
@@ -158,25 +147,16 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.float16,
-    ).to(device)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.float16).to(device)
     model.eval()
 
     prompt = build_long_prompt(tokenizer, context_tokens)
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=context_tokens,
-    )
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=context_tokens)
 
     input_ids = encoded["input_ids"].to(device)
     attention_mask = encoded["attention_mask"].to(device)
 
-    actual_context_tokens = input_ids.shape[-1]
-    print("actual_context_tokens:", actual_context_tokens)
+    print("actual_context_tokens:", input_ids.shape[-1])
 
     prefix_input_ids = input_ids[:, :-1]
     prefix_attention_mask = attention_mask[:, :-1]
@@ -184,9 +164,7 @@ def main() -> None:
     # ---- Baseline: full KV cache stays resident on GPU throughout ----
     print("\nRunning baseline (full KV resident on GPU, no paging)...")
 
-    baseline_outputs = chunked_prefill(
-        model, prefix_input_ids, prefix_attention_mask, PREFILL_CHUNK
-    )
+    baseline_outputs = chunked_prefill(model, prefix_input_ids, prefix_attention_mask, PREFILL_CHUNK)
 
     next_input_id = input_ids[:, -1:]
     current_mask = attention_mask
@@ -202,9 +180,7 @@ def main() -> None:
                 use_cache=True,
                 output_attentions=False,
             )
-            next_token_id = torch.argmax(
-                outputs.logits[:, -1, :], dim=-1, keepdim=True
-            )
+            next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
             baseline_generated.append(int(next_token_id.item()))
 
             current_cache = outputs.past_key_values
@@ -212,11 +188,7 @@ def main() -> None:
             current_mask = torch.cat(
                 [
                     current_mask,
-                    torch.ones(
-                        (current_mask.shape[0], 1),
-                        dtype=current_mask.dtype,
-                        device=current_mask.device,
-                    ),
+                    torch.ones((current_mask.shape[0], 1), dtype=current_mask.dtype, device=current_mask.device),
                 ],
                 dim=1,
             )
@@ -230,18 +202,11 @@ def main() -> None:
     # ---- Paged: pager decides which blocks stay on GPU ----
     print("\nRunning paged (pager-managed GPU/CPU placement)...")
 
-    paged_prefill_outputs = chunked_prefill(
-        model, prefix_input_ids, prefix_attention_mask, PREFILL_CHUNK
-    )
+    paged_prefill_outputs = chunked_prefill(model, prefix_input_ids, prefix_attention_mask, PREFILL_CHUNK)
     full_prefix_past = get_legacy_past_key_values(paged_prefill_outputs)
 
-    full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-        full_prefix_past,
-        tokens_per_block=TOKENS_PER_BLOCK,
-    )
-    kv_blocks = real_past_to_blocks(
-        full_past, tokens_per_block=TOKENS_PER_BLOCK, verbose=False
-    )
+    full_past, tail_past, full_tokens = split_full_blocks_and_tail(full_prefix_past, tokens_per_block=TOKENS_PER_BLOCK)
+    kv_blocks = real_past_to_blocks(full_past, tokens_per_block=TOKENS_PER_BLOCK, verbose=False)
 
     store = KVBlockStore(tokens_per_block=TOKENS_PER_BLOCK)
     for block_id, (key, value) in enumerate(kv_blocks):
@@ -252,13 +217,7 @@ def main() -> None:
     print("total_kv_blocks:", num_blocks)
 
     p = pager.PyPager(
-        vram_budget,
-        RAM_BUDGET,
-        RECENT_WINDOW,
-        REBALANCE_INTERVAL,
-        PROMOTE_MARGIN,
-        RAM_PROMOTE_MARGIN,
-        POLICY,
+        vram_budget, RAM_BUDGET, RECENT_WINDOW, REBALANCE_INTERVAL, PROMOTE_MARGIN, RAM_PROMOTE_MARGIN, POLICY
     )
 
     next_input_id = input_ids[:, -1:]
@@ -268,14 +227,8 @@ def main() -> None:
     for _ in range(new_tokens):
         reload_all_blocks_for_forward(store, device, num_blocks)
 
-        reconstructed_full_past = reconstruct_past_from_store(
-            store=store,
-            num_layers=num_layers,
-            num_blocks=num_blocks,
-        )
-        current_past_for_forward = append_tail_to_reconstructed_past(
-            reconstructed_full_past,
-            tail_past,
+        current_past_for_forward = reconstruct_past_from_store(
+            store=store, num_layers=num_layers, num_blocks=num_blocks, tail_past=tail_past
         )
         cache = DynamicCache.from_legacy_cache(tuple(current_past_for_forward))
 
@@ -291,21 +244,15 @@ def main() -> None:
         next_token_id = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         paged_generated.append(int(next_token_id.item()))
 
-        current_past = get_legacy_past_key_values(outputs)
-        old_num_blocks = num_blocks
-
         num_blocks, tail_past, added_block_ids = append_new_full_blocks_if_needed(
-            store=store,
-            past_key_values=current_past,
-            known_num_blocks=old_num_blocks,
+            store=store, past_key_values=get_legacy_past_key_values(outputs), known_num_blocks=num_blocks
         )
+
+        query_block = num_blocks - 1
 
         # placement here never depends on attention scores (recent_only),
         # so a dummy uniform vector is enough to satisfy the pager API.
-        dummy_attention = [1.0 / num_blocks] * num_blocks
-        query_block = num_blocks - 1
-
-        p.on_step(query_block, 0, dummy_attention)
+        p.on_step(query_block, 0, [1.0 / num_blocks] * num_blocks)
         if added_block_ids:
             p.force_rebalance(query_block)
 
@@ -315,19 +262,13 @@ def main() -> None:
         current_mask = torch.cat(
             [
                 current_mask,
-                torch.ones(
-                    (current_mask.shape[0], 1),
-                    dtype=current_mask.dtype,
-                    device=current_mask.device,
-                ),
+                torch.ones((current_mask.shape[0], 1), dtype=current_mask.dtype, device=current_mask.device),
             ],
             dim=1,
         )
 
     paged_resident_gpu_bytes = store.resident_gpu_bytes()
     paged_resident_cpu_bytes = store.resident_cpu_bytes()
-
-    reduction_pct = 100.0 * (1.0 - paged_resident_gpu_bytes / baseline_full_kv_bytes)
 
     print("\nVRAM savings proof")
     print("-------------------")
@@ -337,16 +278,14 @@ def main() -> None:
     print("baseline_full_kv_mb (if fully resident on GPU):", f"{baseline_full_kv_bytes / 1_000_000:.2f}")
     print("paged_resident_gpu_mb:", f"{paged_resident_gpu_bytes / 1_000_000:.2f}")
     print("paged_resident_cpu_mb:", f"{paged_resident_cpu_bytes / 1_000_000:.2f}")
-    print(f"gpu_kv_reduction: {reduction_pct:.1f}%")
+    print(f"gpu_kv_reduction: {100.0 * (1.0 - paged_resident_gpu_bytes / baseline_full_kv_bytes):.1f}%")
     print("baseline_ids:", baseline_generated)
     print("paged_ids:", paged_generated)
     print("same_token_ids:", baseline_generated == paged_generated)
 
     assert baseline_generated == paged_generated
 
-    print(
-        "\nOK: pager keeps most real Qwen KV cache off the GPU with byte-identical output."
-    )
+    print("\nOK: pager keeps most real Qwen KV cache off the GPU with byte-identical output.")
 
 
 if __name__ == "__main__":

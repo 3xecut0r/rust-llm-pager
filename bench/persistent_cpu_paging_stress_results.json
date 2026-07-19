@@ -9,7 +9,7 @@
   "total_gpu_to_cpu_copies": 252,
   "total_cpu_to_gpu_copies": 246,
   "mean_attention_in_gpu": 0.8627203931018701,
-  "min_attention_in_gpu": 0.6805419697865122,
+  "min_attention_in_gpu": 0.680541969786512,
   "max_attention_in_gpu": 0.9543367689840457,
   "final_gpu_blocks": [
     0,

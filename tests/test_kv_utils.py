@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from pager_hf.kv_utils import (
-    append_tail_to_reconstructed_past,
     extract_single_block_from_past,
     get_legacy_past_key_values,
     real_past_to_blocks,
@@ -13,12 +13,10 @@ from pager_hf.kv_utils import (
 
 
 class FakeBlockStore:
-    """
-    Minimal stand-in for pager_hf.KVBlockStore that only implements what
-    reconstruct_past_from_store needs. The real KVBlockStore requires CUDA
-    tensors (it exists specifically to move blocks GPU <-> CPU), so these
-    tests exercise the tensor-shape bookkeeping in kv_utils on CPU only.
-    """
+    # Minimal stand-in for pager_hf.KVBlockStore that only implements what
+    # reconstruct_past_from_store needs. The real KVBlockStore requires CUDA
+    # tensors (it exists specifically to move blocks GPU <-> CPU), so these
+    # tests exercise the tensor-shape bookkeeping in kv_utils on CPU only.
 
     def __init__(self):
         self._blocks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -43,9 +41,7 @@ def make_fake_past(*, num_layers, batch, kv_heads, seq_len, head_dim, seed=0):
 def test_split_full_blocks_and_tail_splits_at_block_boundary():
     past = make_fake_past(num_layers=2, batch=1, kv_heads=2, seq_len=35, head_dim=4)
 
-    full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-        past, tokens_per_block=16
-    )
+    full_past, tail_past, full_tokens = split_full_blocks_and_tail(past, tokens_per_block=16)
 
     assert full_tokens == 32
     assert full_past[0][0].shape[2] == 32
@@ -55,9 +51,7 @@ def test_split_full_blocks_and_tail_splits_at_block_boundary():
 def test_split_full_blocks_and_tail_handles_exact_multiple():
     past = make_fake_past(num_layers=1, batch=1, kv_heads=1, seq_len=32, head_dim=2)
 
-    full_past, tail_past, full_tokens = split_full_blocks_and_tail(
-        past, tokens_per_block=16
-    )
+    full_past, tail_past, full_tokens = split_full_blocks_and_tail(past, tokens_per_block=16)
 
     assert full_tokens == 32
     assert tail_past[0][0].shape[2] == 0
@@ -67,13 +61,7 @@ def _assert_extract_reconstruct_round_trip(batch: int):
     num_layers, kv_heads, head_dim, tokens_per_block = 3, 2, 4, 16
     seq_len = tokens_per_block * 4
 
-    past = make_fake_past(
-        num_layers=num_layers,
-        batch=batch,
-        kv_heads=kv_heads,
-        seq_len=seq_len,
-        head_dim=head_dim,
-    )
+    past = make_fake_past(num_layers=num_layers, batch=batch, kv_heads=kv_heads, seq_len=seq_len, head_dim=head_dim)
 
     blocks = real_past_to_blocks(past, tokens_per_block=tokens_per_block)
     assert len(blocks) == 4
@@ -86,9 +74,7 @@ def _assert_extract_reconstruct_round_trip(batch: int):
     for block_id, (key, value) in enumerate(blocks):
         store.put(block_id, key, value)
 
-    reconstructed = reconstruct_past_from_store(
-        store=store, num_layers=num_layers, num_blocks=4
-    )
+    reconstructed = reconstruct_past_from_store(store=store, num_layers=num_layers, num_blocks=4)
 
     assert len(reconstructed) == num_layers
 
@@ -112,9 +98,7 @@ def test_extract_and_reconstruct_round_trip_batch_3():
 def test_extract_single_block_from_past_selects_the_right_token_range():
     past = make_fake_past(num_layers=1, batch=1, kv_heads=1, seq_len=32, head_dim=2)
 
-    key, value = extract_single_block_from_past(
-        past, block_id=1, tokens_per_block=16
-    )
+    key, value = extract_single_block_from_past(past, block_id=1, tokens_per_block=16)
 
     # block 1 covers tokens [16:32); after the permute+stack, shape is
     # [num_layers, batch, block_len, kv_heads, head_dim].
@@ -122,17 +106,29 @@ def test_extract_single_block_from_past_selects_the_right_token_range():
     assert torch.equal(key[0], expected_key)
 
 
-def test_append_tail_to_reconstructed_past_concatenates_along_seq_dim():
-    reconstructed = [(torch.zeros(1, 2, 32, 4), torch.zeros(1, 2, 32, 4))]
-    tail = [(torch.ones(1, 2, 3, 4), torch.ones(1, 2, 3, 4))]
+def test_reconstruct_past_from_store_appends_tail_past():
+    num_layers, kv_heads, head_dim, tokens_per_block = 2, 2, 4, 16
+    seq_len = tokens_per_block * 2
 
-    out = append_tail_to_reconstructed_past(reconstructed, tail)
+    past = make_fake_past(num_layers=num_layers, batch=1, kv_heads=kv_heads, seq_len=seq_len, head_dim=head_dim)
+    blocks = real_past_to_blocks(past, tokens_per_block=tokens_per_block)
 
-    key, value = out[0]
-    assert key.shape == (1, 2, 35, 4)
-    assert torch.equal(key[:, :, :32, :], torch.zeros(1, 2, 32, 4))
-    assert torch.equal(key[:, :, 32:, :], torch.ones(1, 2, 3, 4))
-    assert torch.equal(value[:, :, 32:, :], torch.ones(1, 2, 3, 4))
+    store = FakeBlockStore()
+    for block_id, (key, value) in enumerate(blocks):
+        store.put(block_id, key, value)
+
+    tail = [(torch.ones(1, kv_heads, 3, head_dim), torch.ones(1, kv_heads, 3, head_dim)) for _ in range(num_layers)]
+
+    reconstructed = reconstruct_past_from_store(store=store, num_layers=num_layers, num_blocks=2, tail_past=tail)
+
+    for layer_idx in range(num_layers):
+        rec_key, rec_value = reconstructed[layer_idx]
+        orig_key, _ = past[layer_idx]
+
+        assert rec_key.shape == (1, kv_heads, seq_len + 3, head_dim)
+        assert torch.equal(rec_key[:, :, :seq_len, :], orig_key)
+        assert torch.equal(rec_key[:, :, seq_len:, :], tail[layer_idx][0])
+        assert torch.equal(rec_value[:, :, seq_len:, :], tail[layer_idx][1])
 
 
 class _FakeOutputsTuple:
@@ -148,9 +144,7 @@ class _FakeCache:
 
 class _FakeOutputsCacheObject:
     def __init__(self, past):
-        self.past_key_values = _FakeCache(
-            keys=[k for k, _ in past], values=[v for _, v in past]
-        )
+        self.past_key_values = _FakeCache(keys=[k for k, _ in past], values=[v for _, v in past])
 
 
 def test_get_legacy_past_key_values_accepts_tuple_form():
@@ -177,9 +171,5 @@ def test_get_legacy_past_key_values_rejects_missing_cache():
     class _EmptyOutputs:
         past_key_values = None
 
-    try:
+    with pytest.raises(RuntimeError):
         get_legacy_past_key_values(_EmptyOutputs())
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("expected RuntimeError for missing past_key_values")

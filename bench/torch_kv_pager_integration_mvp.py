@@ -3,8 +3,6 @@ from __future__ import annotations
 import random
 
 import torch
-
-import pager
 from torch_kv_block_store import KVBlockStore
 from torch_kv_offload_mvp import (
     DTYPE,
@@ -17,6 +15,7 @@ from torch_kv_offload_mvp import (
     print_summary,
 )
 
+import pager
 
 NUM_BLOCKS = 160
 
@@ -35,16 +34,10 @@ def format_block_list(block_ids: list[int], limit: int = 30) -> str:
     if len(block_ids) <= limit:
         return str(block_ids)
 
-    shown = block_ids[:limit]
-    remaining = len(block_ids) - limit
+    return f"{block_ids[:limit]} ... (+{len(block_ids) - limit} more)"
 
-    return f"{shown} ... (+{remaining} more)"
 
-def make_attention_trace(
-        *,
-        query_block: int,
-        num_blocks: int,
-) -> list[float]:
+def make_attention_trace(*, query_block: int, num_blocks: int) -> list[float]:
     """
     Synthetic attention trace with three patterns:
     - sinks near the beginning
@@ -105,18 +98,11 @@ def main() -> None:
         )
         store.put_gpu(block_id, key, value)
 
-    real_block_size_mb = store.resident_gpu_bytes() / NUM_BLOCKS / 1_000_000
-    print("real_dummy_kv_block_size_mb:", f"{real_block_size_mb:.3f}")
+    print("real_dummy_kv_block_size_mb:", f"{store.resident_gpu_bytes() / NUM_BLOCKS / 1_000_000:.3f}")
     print("note: pager budget controls logical placement; store reports real tensor bytes")
 
     p = pager.PyPager(
-        VRAM_BUDGET,
-        RAM_BUDGET,
-        RECENT_WINDOW,
-        REBALANCE_INTERVAL,
-        PROMOTE_MARGIN,
-        RAM_PROMOTE_MARGIN,
-        POLICY,
+        VRAM_BUDGET, RAM_BUDGET, RECENT_WINDOW, REBALANCE_INTERVAL, PROMOTE_MARGIN, RAM_PROMOTE_MARGIN, POLICY
     )
 
     print_summary("Initial all-GPU KV blocks", store)
@@ -126,31 +112,17 @@ def main() -> None:
 
     # Simulate decode steps.
     for step, query_block in enumerate(range(32, NUM_BLOCKS, 8), start=1):
-        attn = make_attention_trace(
-            query_block=query_block,
-            num_blocks=query_block + 1,
-        )
-
         # In this MVP, pager logical blocks are aligned with store block ids.
-        token_idx = query_block
+        p.on_step(query_block, 0, make_attention_trace(query_block=query_block, num_blocks=query_block + 1))
 
-        p.on_step(token_idx, 0, attn)
-
-        tiers = p.tiers()
-        movement = store.apply_tiers(tiers, device)
+        movement = store.apply_tiers(p.tiers(), device)
         pending_to_gpu.extend(movement["to_gpu"])
         pending_to_cpu.extend(movement["to_cpu"])
 
         if step % 4 == 0:
             print_summary(f"After pager step {step}, query_block={query_block}", store)
-            print(
-                "moved_to_gpu_since_last_report:",
-                format_block_list(pending_to_gpu),
-            )
-            print(
-                "moved_to_cpu_since_last_report:",
-                format_block_list(pending_to_cpu),
-            )
+            print("moved_to_gpu_since_last_report:", format_block_list(pending_to_gpu))
+            print("moved_to_cpu_since_last_report:", format_block_list(pending_to_cpu))
 
             pending_to_gpu.clear()
             pending_to_cpu.clear()
@@ -170,10 +142,7 @@ def main() -> None:
     print("swap_ram_ssd_mb:", bytes_to_mb(metrics.swap_ram_ssd))
     print("attention_mass_total:", f"{metrics.attention_mass_total:.4f}")
     print("attention_mass_vram:", f"{metrics.attention_mass_vram:.4f}")
-    print(
-        "vram_attention_ratio:",
-        f"{metrics.attention_mass_vram / metrics.attention_mass_total:.4f}",
-    )
+    print("vram_attention_ratio:", f"{metrics.attention_mass_vram / metrics.attention_mass_total:.4f}")
 
     print("\nOK: Rust pager controlled real GPU <-> CPU KV-like tensor placement.")
 

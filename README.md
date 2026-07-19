@@ -1,45 +1,82 @@
 # rust-llm-pager
 
-A Rust/PyO3 prototype for KV-cache paging in LLM inference.
+A Rust pager that decides which parts of an LLM's KV cache stay in GPU memory and which get pushed to CPU RAM, without changing a single token of what the model generates.
 
-`rust-llm-pager` experiments with moving KV-cache blocks between GPU and CPU memory while preserving generation correctness. The project starts with a Rust policy simulator, then progressively validates the policy on real PyTorch tensors and real `past_key_values` from `Qwen/Qwen2.5-0.5B-Instruct`.
+As context length grows, the KV cache eventually stops fitting in VRAM. The usual fixes are capping context length or buying a bigger GPU. This project tries a third option: keep only the KV blocks that actually matter — recent tokens, high-attention tokens, or a mix of both — resident on the GPU, and let the rest live in system RAM until they're needed again. The placement decisions run in Rust; the actual tensor movement happens in Python through PyTorch.
 
-The current prototype is not a production inference engine yet. It is a research/engineering milestone that proves a Rust pager can control KV-cache block placement and preserve exact greedy generation after GPU ↔ CPU movement.
+It's still early. Validated so far on one small model (Qwen2.5-0.5B-Instruct), Linux + CUDA only, no vLLM or SGLang integration. But the core claim holds up under testing: paging KV blocks between VRAM and RAM doesn't change generation output, and at long context it cuts GPU memory used for KV cache by 98%+.
+
+---
+
+## Quickstart
+
+Requires Linux, a CUDA GPU, Python 3.10+, and Rust stable. Not on PyPI yet — install from source:
+
+```bash
+git clone https://github.com/3xecut0r/rust-llm-pager.git
+cd rust-llm-pager
+python -m venv .venv && source .venv/bin/activate
+
+pip install -U pip maturin
+pip install torch transformers   # use a CUDA-specific torch wheel for your GPU
+
+maturin develop -m pager/Cargo.toml --release   # build the Rust pager
+pip install -e .                                 # install pager_hf
+```
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from pager_hf import PagedModel
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.float16,
+).to("cuda")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+
+encoded = tokenizer("Explain KV-cache paging in one sentence.", return_tensors="pt").to("cuda")
+
+paged_model = PagedModel(
+    model,
+    vram_budget=128_000_000,   # bytes of VRAM the pager may keep KV blocks in
+    ram_budget=2_000_000_000,  # bytes of CPU RAM for everything else
+    policy="recent_only",      # or "sinks_heavy_hitter" for short, quality-sensitive contexts
+)
+
+generated_ids = paged_model.generate(
+    input_ids=encoded["input_ids"],
+    attention_mask=encoded["attention_mask"],
+    max_new_tokens=64,
+)
+print(tokenizer.decode(generated_ids))
+```
+
+That's the whole surface for a first run. For exact dependency versions see [Installation](#installation); for persistence across turns, batching, and policy tradeoffs see [Python API: `pager_hf.PagedModel`](#python-api-pager_hfpagedmodel).
 
 ---
 
 ## Why this exists
 
-LLM inference becomes memory-bound quickly as context length grows. The KV cache can consume a large amount of VRAM, especially for long prompts, concurrent requests, or smaller GPUs.
+LLM inference gets memory-bound fast as context grows. KV cache eats VRAM, and it eats more of it the longer the prompt, the more concurrent requests, or the smaller the GPU. If you're running on a 4–8GB card, this shows up quickly.
 
-The goal of this project is to explore whether a small Rust pager can decide which KV blocks should stay in VRAM and which blocks can be moved to slower tiers such as CPU RAM or eventually SSD.
+The bet here is that not all KV blocks are equally worth keeping on the GPU at any given moment. Some are ancient history the model barely attends to; a few "sink" tokens near the start matter disproportionately regardless of recency; others are genuinely load-bearing because the model keeps attending back to them. A pager that tells the difference should be able to fit a longer context in the same VRAM budget than one that just keeps everything resident, or one that naively evicts by recency alone.
 
-The long-term goal is to integrate this idea with runtimes such as vLLM, LMCache, or another inference backend.
+Whether this belongs bolted onto an existing serving engine (vLLM, LMCache) or as its own thing is still an open question — see [Limitations](#important-limitations) for what came out of actually looking into vLLM's internals.
 
 ---
 
-## Current status
+## What works today
 
-Implemented and validated:
+- Rust pager core with four placement policies, exposed to Python via PyO3.
+- Real GPU ↔ CPU movement of actual Qwen `past_key_values` tensors, not synthetic stand-ins.
+- A persistent KV store that lives across an entire generation, growing as new blocks are produced.
+- `pager_hf.PagedModel`: an installable wrapper around HuggingFace `transformers` that does all of the above behind a `generate()` call — with session persistence across calls and real batched generation.
+- Every one of these is checked against a plain, unpaged baseline. If token IDs don't match exactly, it's a bug. See [How this was validated](#how-this-was-validated) for what's actually been run and what the numbers look like.
 
-- Rust pager core with PyO3 bindings.
-- Multiple KV placement policies.
-- Multi-needle soft-masked benchmark.
-- Real PyTorch KV-like GPU ↔ CPU movement.
-- Real Qwen `past_key_values` extraction and block splitting.
-- Exact KV block roundtrip validation.
-- Identical next-token logits after KV reconstruction.
-- Identical multi-token greedy generation after KV reconstruction.
-- Paged real Qwen generation loop.
-- Baseline vs paged generation comparison with identical token IDs.
-- Persistent CPU KV paging loop with a single long-lived store and pager across generation.
-- Growing KV store (new full blocks appended mid-generation) without breaking correctness.
-- Policy comparison (`recent_only`, `sinks_recent`, `heavy_hitter`, `sinks_heavy_hitter`) inside the persistent loop.
-
-Current headline result:
+Headline result, reproducible with `python bench/real_kv_paged_model_api_mvp.py`:
 
 ```text
-OK: paged real Qwen KV loop produces identical greedy generation to baseline.
+OK: pager_hf.PagedModel produces identical greedy generation to baseline.
 ```
 
 ---
@@ -65,398 +102,39 @@ GPU <-> CPU KV movement
 Reconstructed cache used for generation
 ```
 
-The Rust side decides block placement. The Python side uses PyTorch to store and physically move tensors.
+Rust decides where each block should live; Python does the actual copying. Splitting it this way means the placement logic — the part worth getting right — is pure, deterministic, and testable without a GPU, while the tensor movement stays in PyTorch where it belongs.
 
 ---
 
 ## Policies
-
-Implemented policies:
 
 | Policy | Description |
 |---|---|
 | `recent_only` | Keeps the most recent blocks in VRAM. |
 | `sinks_recent` | Keeps sink blocks plus recent blocks. |
 | `heavy_hitter` | Keeps blocks with high accumulated attention score. |
-| `sinks_heavy_hitter` | Hybrid policy: sink blocks + limited recent tail + high-attention blocks. |
+| `sinks_heavy_hitter` | Hybrid: sink blocks + a limited recent tail + whatever's left of the VRAM budget goes to the highest-attention blocks. |
 
-The strongest current policy is:
-
-```text
-sinks_heavy_hitter
-```
-
-It keeps:
-
-1. early sink blocks,
-2. a limited recent tail,
-3. the remaining VRAM budget filled with high-attention blocks.
-
----
-
-## Benchmark result
-
-The multi-needle soft-masked benchmark evaluates 7 needle-in-haystack prompts across 15 penalty settings per prompt.
-
-Main result:
-
-| Policy | Wins |
-|---|---:|
-| `sinks_heavy_hitter` | 86 / 105 |
-| `recent_only` | 9 / 105 |
-| `heavy_hitter` | 8 / 105 |
-| `sinks_recent` | 2 / 105 |
-
-For strong SSD penalties (`SSD <= -6`):
-
-| Policy | Wins |
-|---|---:|
-| `sinks_heavy_hitter` | 55 / 56 |
-| `sinks_recent` | 1 / 56 |
-| `heavy_hitter` | 0 / 56 |
-| `recent_only` | 0 / 56 |
-
-Aggregate result:
-
-| Policy | Mean PPL | Median PPL | Attention in VRAM | Swap total |
-|---|---:|---:|---:|---:|
-| `sinks_heavy_hitter` | ~384.3 | ~18.5 | ~0.660 | ~3.36 GB |
-| `heavy_hitter` | ~2866.9 | ~420.7 | ~0.543 | ~3.05 GB |
-| `sinks_recent` | ~3158.5 | ~1221.9 | ~0.386 | ~2.18 GB |
-| `recent_only` | ~4414.3 | ~1149.4 | ~0.014 | ~2.18 GB |
-
-The hybrid policy fixes failure modes where pure heavy-hitter misses important recent or sink context.
-
----
-
-## Real tensor movement MVP
-
-The project includes a first real tensor movement prototype outside of vLLM.
-
-This MVP creates KV-like PyTorch tensors, stores them as blocks, and lets the Rust pager decide which blocks should stay on GPU. All non-VRAM tiers are currently mapped to CPU.
-
-Current scope:
-
-- Real CUDA tensors.
-- Real GPU → CPU copies.
-- Real CPU → GPU copies.
-- Rust pager controls physical tensor placement.
-- SSD tier is currently mapped to CPU / simulated.
-- Not yet integrated into a production inference runtime.
-
-Example result:
-
-| Metric | Value |
-|---|---:|
-| Total blocks | 160 |
-| GPU-resident blocks | 15 |
-| CPU-resident blocks | 145 |
-| Real GPU resident KV | ~11.8 MB |
-| Real CPU resident KV | ~114.0 MB |
-| GPU → CPU copied | ~126.6 MB |
-| CPU → GPU copied | ~12.6 MB |
-| Attention in VRAM | ~49.6% |
-
-The pager-selected VRAM blocks match the actual GPU-resident tensor blocks in the store:
-
-```text
-pager: [0, 1, 2, 3, 20, 21, 55, 56, 146, 147, 148, 149, 150, 151, 152]
-store: [0, 1, 2, 3, 20, 21, 55, 56, 146, 147, 148, 149, 150, 151, 152]
-```
-
-This proves that the Rust policy can control real KV-like tensor placement.
-
----
-
-## Real Qwen KV-cache block MVP
-
-The project extracts real `past_key_values` from `Qwen/Qwen2.5-0.5B-Instruct`, splits them into KV blocks, and applies Rust pager placement to those real model KV tensors.
-
-Example run:
-
-| Metric | Value |
-|---|---:|
-| Model | `Qwen/Qwen2.5-0.5B-Instruct` |
-| Layers | 24 |
-| KV heads | 2 |
-| Head dim | 64 |
-| Prompt sequence length | 151 |
-| Tokens per block | 16 |
-| Full KV blocks | 9 |
-| GPU-resident blocks | 7 |
-| CPU-resident blocks | 2 |
-| Real model KV block size | ~0.197 MB |
-| Real GPU-resident KV | ~1.38 MB |
-| Real CPU-resident KV | ~0.39 MB |
-| Real attention kept on GPU | ~94.0% |
-
-The pager-selected VRAM blocks match the actual GPU-resident KV blocks:
-
-```text
-pager: [0, 1, 2, 3, 6, 7, 8]
-store: [0, 1, 2, 3, 6, 7, 8]
-```
-
-This proves that the Rust pager can control placement of real model `past_key_values`, not only dummy KV-like tensors.
-
----
-
-## KV roundtrip correctness
-
-The project validates that real Qwen KV blocks survive GPU → CPU → GPU movement exactly.
-
-Test flow:
-
-```text
-real Qwen past_key_values
--> split into KV blocks
--> move selected blocks GPU -> CPU
--> reload blocks CPU -> GPU
--> reconstruct past_key_values
--> compare with original KV tensors
-```
-
-Example result:
-
-```text
-Roundtrip comparison
---------------------
-max_key_diff: 0.0
-max_value_diff: 0.0
-
-OK: real Qwen KV blocks survived GPU -> CPU -> GPU roundtrip exactly.
-```
-
----
-
-## Logits correctness
-
-The project validates that reconstructed real Qwen KV cache produces identical next-token logits.
-
-Test flow:
-
-```text
-original past_key_values -> next-token logits
-reconstructed past_key_values -> next-token logits
-```
-
-Example result:
-
-```text
-Logits roundtrip comparison
----------------------------
-max_logits_diff: 0.0
-mean_logits_diff: 0.0
-same_argmax: True
-original_argmax: 304 ' in'
-reconstructed_argmax: 304 ' in'
-
-OK: reconstructed real Qwen KV cache produces identical next-token logits.
-```
-
----
-
-## Multi-token generation roundtrip
-
-The project validates that reconstructed real Qwen KV cache can produce identical multi-token greedy generation.
-
-Test flow:
-
-```text
-Qwen past_key_values
--> split into KV blocks
--> GPU -> CPU offload
--> CPU -> GPU reload
--> reconstruct past_key_values
--> greedy decode from reconstructed cache
-```
-
-Example result:
-
-| Metric | Value |
-|---|---:|
-| Generated tokens | 8 |
-| Same token IDs | `true` |
-| Max KV diff after roundtrip | `0.0` |
-| Max logits diff after roundtrip | `0.0` |
-
-Example generated text:
-
-```text
-original:      ' in the first paragraph? The secret project'
-reconstructed: ' in the first paragraph? The secret project'
-```
-
-This confirms that reconstructed real Qwen KV cache can produce identical multi-token greedy generation.
-
----
-
-## Paged generation loop
-
-The project includes a multi-step paged generation loop prototype.
-
-The loop does the following on every generation step:
-
-```text
-real past_key_values
--> split full KV blocks
--> keep incomplete tail tokens hot
--> Rust pager chooses GPU/CPU placement
--> offload cold full blocks GPU -> CPU
--> reload full blocks for HuggingFace forward
--> reconstruct full-block KV
--> append tail KV back
--> generate next token
--> repeat
-```
-
-This is still not an efficient production runtime because HuggingFace forward currently receives a full reconstructed GPU cache. However, it demonstrates that the pager can operate inside a real generation loop without losing correctness.
-
-Example result:
-
-```text
-generated_text: ' BLUE ORCHID. The secret project'
-total_gpu_to_cpu_mb: 3.15
-total_cpu_to_gpu_mb: 3.15
-total_gpu_to_cpu_copies: 16
-total_cpu_to_gpu_copies: 16
-
-OK: real Qwen KV cache was paged in a multi-step generation loop.
-```
-
----
-
-## Baseline vs paged Qwen generation
-
-The strongest current correctness demo compares normal Qwen greedy generation against the paged KV loop.
-
-Test flow:
-
-```text
-baseline:
-Qwen cache -> greedy decode
-
-paged:
-Qwen cache
--> split full KV blocks
--> keep tail tokens hot
--> Rust pager chooses GPU/CPU placement
--> offload cold blocks GPU -> CPU
--> reload required blocks CPU -> GPU
--> reconstruct cache
--> append tail KV
--> greedy decode
-```
-
-Example result:
-
-| Metric | Value |
-|---|---:|
-| Model | `Qwen/Qwen2.5-0.5B-Instruct` |
-| Generated tokens | 8 |
-| Same token IDs as baseline | `true` |
-| Total GPU → CPU copied | ~3.15 MB |
-| Total CPU → GPU copied | ~3.15 MB |
-| GPU → CPU copies | 16 |
-| CPU → GPU copies | 16 |
-| Mean attention kept on GPU | ~93.6% |
-| Min attention kept on GPU | ~91.5% |
-| Max attention kept on GPU | ~95.4% |
-
-Example output:
-
-```text
-baseline_ids: [55892, 2726, 2149, 915, 13, 576, 6234, 2390]
-paged_ids:    [55892, 2726, 2149, 915, 13, 576, 6234, 2390]
-same_token_ids: True
-baseline_text: ' BLUE ORCHID. The secret project'
-paged_text:    ' BLUE ORCHID. The secret project'
-
-OK: paged real Qwen KV loop produces identical greedy generation to baseline.
-```
-
-This confirms that the paged real Qwen KV loop can preserve exact greedy generation while moving KV blocks between GPU and CPU.
-
----
-
-## Persistent CPU KV paging (real Qwen)
-
-The paged generation loop above rebuilds the KV store from scratch on every run. The persistent paging MVPs go one step further: a single `KVBlockStore` and Rust `PyPager` live across the entire generation loop, and new full KV blocks are appended to the store as they are produced (the recent "tail" is kept hot until it fills a block).
-
-Test flow, repeated every generation step:
-
-```text
-persistent KV store (built once)
--> reload any GPU-needed blocks for this step
--> reconstruct full-block KV + hot tail
--> forward pass, get next token + attention
--> append newly completed full blocks to the store
--> Rust pager scores blocks and (re)places tiers
--> apply GPU/CPU tier movement
--> repeat
-```
-
-Three MVPs validate this end to end:
-
-| Script | Tokens | Purpose |
-|---|---:|---|
-| `real_kv_persistent_cpu_paging_loop_mvp.py` | 24 | Smoke test of the persistent loop. |
-| `real_kv_persistent_cpu_paging_stress_mvp.py` | 64 | Longer run that forces multiple new blocks to appear. |
-| `real_kv_persistent_policy_compare_mvp.py` | 64 (configurable) | Runs all four policies through the same persistent loop and compares them. |
-
-All three assert `same_token_ids == True` against a plain greedy baseline, i.e. persistent GPU ↔ CPU paging plus block growth does not change generation output.
-
-Both persistent MVPs accept `--tokens N` (override generated token count) and `--quiet` (suppress per-step debug output, print only the final summary).
-
-Latest policy comparison (`real_kv_persistent_policy_compare_mvp.py`, 64 tokens):
-
-| Policy | Same as baseline | New blocks | Final blocks | Mean attn in VRAM | Min attn in VRAM |
-|---|---|---:|---:|---:|---:|
-| `heavy_hitter` | True | 4 | 13 | 0.8717 | 0.5137 |
-| `sinks_heavy_hitter` | True | 4 | 13 | 0.8627 | 0.6805 |
-| `recent_only` | True | 4 | 13 | 0.6244 | 0.3686 |
-| `sinks_recent` | True | 4 | 13 | 0.6244 | 0.3686 |
-
-`heavy_hitter` and `sinks_heavy_hitter` keep noticeably more attention mass resident in VRAM than the recency-only policies, while all four preserve exact baseline token IDs. Full results (including GPU/CPU byte counts and final block placement) are written to [`bench/persistent_policy_compare_results.csv`](bench/persistent_policy_compare_results.csv) and [`bench/persistent_policy_compare_results.md`](bench/persistent_policy_compare_results.md) on every run.
-
----
-
-## Does this actually save VRAM?
-
-Everything above proves the mechanism doesn't break correctness. It doesn't yet show that it matters: with a 151-token prompt, the whole KV cache is a couple of MB, so paging it around is not solving any real memory problem. `bench/real_kv_vram_savings_proof_mvp.py` closes that gap by running at a context long enough for the KV cache itself to become a meaningful amount of memory, and measuring it directly (using the low-level `KVBlockStore`/`PyPager` primitives directly, the same way the earlier persistent-loop MVPs do).
-
-Two things had to be fixed to make that test possible, both worth knowing about if you push context length further:
-
-- **A single long forward pass OOMs on its own, unrelated to KV paging.** HuggingFace computes logits for every position in one call, and with a ~152k vocabulary a 8,000-token prefill alone tries to allocate ~2.3 GB just for logits. The fix is chunked prefill (feed the prefix in pieces, discard each chunk's logits), used identically for both the baseline and the paged run.
-- **`output_attentions=True` (needed by `heavy_hitter`/`sinks_heavy_hitter` to score blocks) forces eager attention**, which materializes a full `seq_len x seq_len` matrix per layer, kept resident for all layers at once. That's fine at ~150 tokens but becomes the actual memory bottleneck at long context, well before KV-cache residency does. This proof therefore uses `recent_only`, whose placement decisions don't depend on attention scores at all — `output_attentions` stays off, and eager attention is never triggered.
-
-With those two fixed, the real result at a realistic long context:
-
-| Context tokens | Full KV if resident on GPU | Resident on GPU under pager | Resident on CPU | Reduction | Same output as baseline |
-|---:|---:|---:|---:|---:|---|
-| 5,922 | 72.86 MB | 1.38 MB | 71.37 MB | 98.1% | `True` |
-| 11,750 | 144.47 MB | 1.38 MB | 142.93 MB | 99.0% | `True` |
-
-The pager keeps a fixed ~7 blocks resident on GPU (set by `VRAM_BUDGET`) no matter how long the context grows, while the CPU absorbs the rest — and the generated tokens are still byte-identical to a baseline that never offloads anything. This is the actual value proposition: the same generation, on a fraction of the GPU memory that would otherwise be pinned down by the KV cache, scaling as context grows instead of scaling with it.
-
-Reproduce it:
-
-```bash
-python bench/real_kv_vram_savings_proof_mvp.py --context-tokens 12000 --new-tokens 8
-```
-
-This is still Qwen2.5-0.5B, which has only 2 KV heads (~12 KB of KV cache per token across all 24 layers) — small even at tens of thousands of tokens. Larger models with more KV heads hit real VRAM ceilings at far shorter contexts, which is the scenario this mechanism is actually for.
+`sinks_heavy_hitter` is the strongest policy so far, both in the multi-needle benchmark and in how much attention mass it keeps resident on GPU. `recent_only` and `sinks_recent` don't use attention scores at all for placement, which is a real tradeoff: they're the only policies that currently scale to batched generation and don't need `output_attentions` — see [Python API](#python-api-pager_hfpagedmodel).
 
 ---
 
 ## Python API: `pager_hf.PagedModel`
 
-All of the other MVPs are validation harnesses, not the intended way to use this project. `pager_hf` is a first cut at the real, installable interface: a thin wrapper around a HuggingFace causal LM that reuses the same Rust pager and KV block store, but without any of the debug printing or CLI plumbing.
+Everything under `bench/` is a validation script, not the intended way to use this project. `pager_hf` is the real, installable interface — a thin wrapper around a HuggingFace causal LM that reuses the same Rust pager and KV block store, minus the debug printing and CLI plumbing that the bench scripts are full of.
 
-`PagedModel` adapts itself to the chosen policy:
+`PagedModel` adapts itself to the policy you give it. `recent_only` and `sinks_recent` never look at attention scores for placement (see `pager/src/core.rs`), so `PagedModel` skips `output_attentions` entirely and prefills in chunks. `heavy_hitter` and `sinks_heavy_hitter` need a real attention signal, so `output_attentions=True` stays on during decoding.
 
-- **`recent_only` / `sinks_recent`** — placement never uses attention scores (see `pager/src/core.rs`), so `PagedModel` skips `output_attentions` entirely and prefills in chunks. This is the path validated at long context in the section above — `bench/real_kv_paged_model_long_context_mvp.py` runs `PagedModel` itself (not the low-level primitives) at ~6,000 tokens and gets byte-identical output to baseline.
-- **`heavy_hitter` / `sinks_heavy_hitter`** — placement needs a real attention signal, so `output_attentions=True` (and eager attention) stays on during decoding. This is the path validated at short context by `bench/real_kv_paged_model_api_mvp.py`. It does not currently scale to long context (see "Does this actually save VRAM?" above) — that's real remaining work, not yet a solved problem.
+Both kinds scale to long context, which wasn't obvious going in — every `PagedModel` forward call, whether priming a token or decoding one, processes exactly one token against the reconstructed cache. That means `output_attentions=True` there only costs a `[heads, 1, total_len]` matrix per layer (linear in context length), not the quadratic `[heads, seq_len, seq_len]` a bulk forward call would need. `bench/real_kv_paged_model_long_context_mvp.py --policy <name>` checks all four policies at ~6,000 tokens for byte-identical output against baseline:
+
+| Policy | Same as baseline | Mean attention kept on GPU |
+|---|---|---:|
+| `recent_only` | `True` | n/a — placement ignores attention |
+| `sinks_recent` | `True` | n/a — placement ignores attention |
+| `heavy_hitter` | `True` | 0.5615 |
+| `sinks_heavy_hitter` | `True` | 0.5464 |
+
+All four keep the same fixed ~7 blocks resident on GPU (set by `vram_budget`); the attention-scored policies keep noticeably more of the real attention mass on GPU than a uniform 7-of-370 selection would (~0.019), which is the same quality edge the multi-needle benchmark shows at short context.
 
 ```python
 import torch
@@ -489,7 +167,7 @@ print(paged_model.last_run_stats)  # swap volume, attention kept on GPU, etc.
 
 ### Persistence across `generate()` calls
 
-The KV block store and pager live on the `PagedModel` instance, not inside `generate()`. Each call is given the **full sequence so far** (previous input + previously generated tokens + any new tokens) and only the delta beyond what was already processed gets forward-passed — this is what makes a multi-turn session cheap instead of re-prefilling from scratch every turn:
+The KV block store and pager live on the `PagedModel` instance, not inside `generate()`. Each call is given the full sequence so far — previous input, previously generated tokens, and any new tokens — and only the delta beyond what was already processed gets forward-passed. That's what makes a multi-turn session cheap instead of re-prefilling from scratch on every turn:
 
 ```python
 paged_model = PagedModel(model, vram_budget=128_000_000, ram_budget=2_000_000_000, policy="recent_only")
@@ -504,30 +182,27 @@ turn2 = paged_model.generate(input_ids=ids2, attention_mask=mask2, max_new_token
 paged_model.reset()  # drop the session; the next generate() call starts fresh
 ```
 
-Passing a shorter `input_ids` than what's already primed, or one that diverges from the already-primed prefix, raises `ValueError` instead of silently corrupting the KV cache — `generate()` cannot "rewind" a session, only extend it or be `reset()`.
+Pass a shorter `input_ids` than what's already primed, or one that diverges from the already-primed prefix, and you get a `ValueError` instead of a silently corrupted KV cache. `generate()` can extend a session or be reset — it can't rewind one.
 
 ### Batching (`batch_size > 1`)
 
-`generate()` accepts a real batch — one forward call per step across every row, not a Python loop — under two constraints:
+`generate()` accepts a real batch — one forward call per step across every row, not a Python loop over rows — under two constraints. Every row needs the same total length (real tokens plus padding), and `attention_mask` per row has to be zero or more leading zeros followed by all ones — standard left-padding, the usual convention for batched causal-LM generation. Right-padding or masking with gaps in the middle raises `NotImplementedError` rather than doing something quietly wrong. And it only works for `recent_only` / `sinks_recent`: those place blocks purely by recency and position, so every row in an equal-length batch gets the same placement decision, which means one shared `PyPager` and one shared `KVBlockStore` is enough. A block can be entirely padding for a shorter row and that's harmless — `attention_mask` excludes those positions from attention regardless of what's physically stored there. `heavy_hitter` / `sinks_heavy_hitter` would need per-row placement and per-row attention extraction, which doesn't exist yet, so passing one of them with `batch_size > 1` raises `NotImplementedError`.
 
-- **Same length, no padding.** Every row in the batch must have identical length; `attention_mask` must be all ones. Ragged/padded batches aren't supported yet.
-- **`recent_only` / `sinks_recent` only.** These policies place blocks purely by recency/position, so every row in an equal-length batch gets the *same* placement decision — one shared `PyPager` and one shared `KVBlockStore` (whose blocks now carry a batch dimension) is enough. `heavy_hitter` / `sinks_heavy_hitter` would need per-row placement and per-row attention extraction, neither of which exists yet; passing one of them with `batch_size > 1` raises `NotImplementedError` rather than silently doing something wrong.
+Position IDs are derived from `attention_mask` (`cumsum(-1) - 1`, clamped at padded positions) rather than assumed to be a plain `0..n-1` range — that's the part that actually makes padding produce correct output instead of silently wrong output.
 
 ```python
-# input_ids/attention_mask: [batch_size, seq_len], all rows the same length
+# rows can be different real lengths; left-pad to a common total length
 generated = paged_model.generate(input_ids=batched_ids, attention_mask=batched_mask, max_new_tokens=64)
 # -> list[list[int]] when batch_size > 1 (list[int] when batch_size == 1, unchanged)
 ```
 
-`bench/real_kv_paged_model_batch_mvp.py` proves this against the ground truth: three *different* prompts run together in one `batch_size=3` call produce, row for row, byte-identical output to running each prompt alone through `batch_size=1`.
+`bench/real_kv_paged_model_batch_mvp.py` checks this against the ground truth: three different-length prompts, left-padded to a common length and run together in one `batch_size=3` call, produce — row for row — byte-identical output to running each prompt alone, unpadded, at `batch_size=1`.
 
-Install it (editable, alongside the Rust extension):
+### Installing and validating
 
 ```bash
 pip install -e .
 ```
-
-Validation:
 
 ```bash
 python bench/real_kv_paged_model_api_mvp.py           # short context, sinks_heavy_hitter
@@ -536,13 +211,73 @@ python bench/real_kv_paged_model_persistence_mvp.py   # split across generate() 
 python bench/real_kv_paged_model_batch_mvp.py         # batch_size > 1 == per-row batch_size == 1
 ```
 
-Current limitations of `pager_hf`:
+### Current limitations of `pager_hf`
 
 - Greedy decoding only.
-- `batch_size > 1` requires equal-length rows (no padding) and `recent_only`/`sinks_recent`; ragged batches and attention-scored policies at batch>1 aren't supported.
-- New tokens beyond what's already primed are still fed through the model one at a time (matching how every other MVP in this project scores blocks per token); priming a very long new turn in one `generate()` call is not yet chunked the way the initial prefill is.
-- `heavy_hitter` / `sinks_heavy_hitter` still don't scale to long context — only the attention-free policies do today.
-- Same VRAM ↔ CPU-only scope as the rest of the project; no SSD tier, no vLLM/LMCache integration.
+- `batch_size > 1` needs left-padding to a common total length and `recent_only`/`sinks_recent`; right-padding, gapped masking, and attention-scored policies at `batch_size > 1` aren't supported.
+- New tokens beyond what's already primed get fed through the model one at a time (matching how every other script in this project scores blocks per token). Priming a very long new turn in one `generate()` call isn't chunked the way the initial prefill is.
+- Same VRAM ↔ CPU-only scope as the rest of the project — no SSD tier, no vLLM/LMCache integration.
+
+---
+
+## Does this actually save VRAM?
+
+Everything above proves the mechanism doesn't break correctness. It doesn't prove it matters — with a 151-token prompt, the whole KV cache is a couple of MB, and paging a couple of MB around isn't solving anyone's memory problem. `bench/real_kv_vram_savings_proof_mvp.py` closes that gap: it runs at a context long enough for the KV cache itself to become a meaningful amount of memory, and measures it directly.
+
+Getting there required fixing one thing unrelated to KV paging: a single long forward pass OOMs on its own, because HuggingFace computes logits for every position in the call, and with a ~152k vocabulary an 8,000-token prefill alone tries to allocate roughly 2.3GB just for logits. Chunked prefill — feed the prefix in pieces, discard each chunk's logits — fixes it, and both the baseline and the paged run use it identically.
+
+This proof runs with `recent_only`, but that's not a hard requirement; see the long-context note in the [Python API](#python-api-pager_hfpagedmodel) section above for why `heavy_hitter` and `sinks_heavy_hitter` also scale. With the OOM fixed, the real result at a realistic long context:
+
+| Context tokens | Full KV if resident on GPU | Resident on GPU under pager | Resident on CPU | Reduction | Same output as baseline |
+|---:|---:|---:|---:|---:|---|
+| 5,922 | 72.86 MB | 1.38 MB | 71.37 MB | 98.1% | `True` |
+| 11,750 | 144.47 MB | 1.38 MB | 142.93 MB | 99.0% | `True` |
+
+The pager keeps a fixed ~7 blocks resident on GPU (set by `VRAM_BUDGET`) no matter how long the context grows, while CPU absorbs the rest, and the generated tokens are still byte-identical to a baseline that never offloads anything. That's the actual value proposition: the same generation on a fraction of the GPU memory that would otherwise be pinned down by the KV cache, scaling as context grows instead of scaling with it.
+
+```bash
+python bench/real_kv_vram_savings_proof_mvp.py --context-tokens 12000 --new-tokens 8
+```
+
+Worth being honest about: this is still Qwen2.5-0.5B, which has only 2 KV heads — about 12KB of KV cache per token across all 24 layers, tiny even at tens of thousands of tokens. Larger models with more KV heads hit real VRAM ceilings at far shorter contexts, which is the scenario this mechanism is actually built for. This proof shows the mechanism works; it doesn't yet show a model where you'd feel the difference on real hardware.
+
+---
+
+## How this was validated
+
+Getting from "a Rust struct that scores blocks" to "this doesn't break a real model's output" took a series of increasingly strict checks, each built on the last. In order:
+
+1. **Dummy tensors first.** Before touching a real model, the pager moved 160 fake KV-shaped tensors between GPU and CPU and picked exactly the blocks it said it would keep — the pager's own list of GPU-resident blocks matched the store's actual GPU-resident blocks, byte for byte: `[0, 1, 2, 3, 20, 21, 55, 56, 146, 147, 148, 149, 150, 151, 152]` on both sides.
+2. **Real Qwen KV blocks.** Same check, but with `past_key_values` actually extracted from Qwen2.5-0.5B-Instruct. Placement decisions still matched what physically ended up on the GPU.
+3. **Roundtrip correctness.** KV blocks sent GPU → CPU → GPU came back bit-identical — `max_key_diff: 0.0`, `max_value_diff: 0.0`.
+4. **Logits, then multi-token generation.** Reconstructed KV cache produced identical next-token logits, then identical greedy decoding across multiple tokens, then output identical to a normal, unpaged generation run.
+5. **A real generation loop.** Not a one-shot check — a full multi-step decode loop paging blocks between GPU and CPU on every token produced output identical to baseline.
+6. **A persistent, growing KV store.** Instead of rebuilding the store every run, one `KVBlockStore` and one `PyPager` now live across an entire generation, with new blocks appended as context grows. Validated at 24 and 64 generated tokens across all four policies:
+
+   | Policy | Same as baseline | New blocks | Final blocks | Mean attn in VRAM | Min attn in VRAM |
+   |---|---|---:|---:|---:|---:|
+   | `heavy_hitter` | True | 4 | 13 | 0.8717 | 0.5137 |
+   | `sinks_heavy_hitter` | True | 4 | 13 | 0.8627 | 0.6805 |
+   | `recent_only` | True | 4 | 13 | 0.6244 | 0.3686 |
+   | `sinks_recent` | True | 4 | 13 | 0.6244 | 0.3686 |
+
+   `heavy_hitter` and `sinks_heavy_hitter` keep noticeably more attention mass resident in VRAM here, while all four preserve exact baseline token IDs. `real_kv_persistent_cpu_paging_loop_mvp.py` (24 tokens), `real_kv_persistent_cpu_paging_stress_mvp.py` (64 tokens, forces multiple new blocks), and `real_kv_persistent_policy_compare_mvp.py` (all four policies, `--tokens N` and `--quiet` supported) cover this.
+
+7. **A quality benchmark, not just correctness.** A multi-needle-in-a-haystack test — 7 prompts × 15 memory-penalty settings — showed `sinks_heavy_hitter` winning 86 of 105 configurations overall, and 55 of 56 under the strictest VRAM penalties (`SSD <= -6`):
+
+   | Policy | Wins (overall) | Wins (`SSD <= -6`) | Mean PPL | Attention in VRAM |
+   |---|---:|---:|---:|---:|
+   | `sinks_heavy_hitter` | 86 / 105 | 55 / 56 | ~384.3 | ~0.660 |
+   | `heavy_hitter` | 8 / 105 | 0 / 56 | ~2866.9 | ~0.543 |
+   | `sinks_recent` | 2 / 105 | 1 / 56 | ~3158.5 | ~0.386 |
+   | `recent_only` | 9 / 105 | 0 / 56 | ~4414.3 | ~0.014 |
+
+   The hybrid policy fixes the failure modes where pure heavy-hitter misses important recent or sink context, and where pure recency misses everything else.
+
+8. **Does it actually matter?** All of the above ran on prompts short enough that the KV cache was a couple of MB, which proves correctness but nothing about real memory pressure. See [Does this actually save VRAM?](#does-this-actually-save-vram) above for the long-context numbers — 98–99% GPU memory reduction for KV cache, still byte-identical output.
+9. **The installable API, not just internals.** Everything up to this point exercised the low-level `KVBlockStore`/`PyPager` primitives directly. `pager_hf.PagedModel` — the thing meant to actually get used — is checked separately against the same bar: identical output at short and long context, correct behavior across multiple `generate()` calls, and correct output for a real batch of different-length, left-padded prompts. See [Python API](#python-api-pager_hfpagedmodel) above.
+
+Every one of these is a runnable script under `bench/`; none of them are CI unit tests, because they need a real GPU and a downloaded model. `python bench/real_kv_paged_model_api_mvp.py` and `python bench/real_kv_vram_savings_proof_mvp.py` are the two most worth running if you want to see the proof yourself rather than take this README's word for it.
 
 ---
 
@@ -552,6 +287,7 @@ Current limitations of `pager_hf`:
 pager/
   Cargo.toml
   Cargo.lock
+  pyproject.toml   # packaging for rust-llm-pager-core, the compiled pager extension
   src/
     core.rs       # Rust pager policies and placement logic
     lib.rs        # PyO3 bindings
@@ -590,13 +326,16 @@ pager_hf/
   paged_model.py      # PagedModel: the installable HF integration
 
 tests/
-  test_kv_utils.py    # CPU-only unit tests, run in CI
+  test_kv_utils.py            # CPU-only unit tests, run in CI
+  test_paged_model_padding.py # position_ids / left-padding validation, CPU-only
 
 .github/workflows/
-  ci.yml               # cargo test + pytest, no GPU needed
+  ci.yml               # cargo test + pytest + packaging check, no GPU needed
 
-pyproject.toml        # packaging for pager_hf (pip install -e .)
+pyproject.toml   # packaging for pager-hf
 ```
+
+Two PyPI packages come out of this repo: `rust-llm-pager-core` (the compiled Rust extension, imported as `pager`) and `pager-hf` (the pure-Python `pager_hf` package, which depends on the former). They're split because a single wheel can't cleanly bundle a compiled extension under one import name alongside a separate pure-Python package under another — maturin tries to nest one inside the other when you attempt it, and splitting the packages was simpler than fighting that.
 
 ---
 
@@ -623,9 +362,7 @@ pip install -U pip maturin
 pip install torch transformers accelerate
 ```
 
-If using a CUDA-specific PyTorch wheel, install PyTorch according to your CUDA version first.
-
-Example used during development:
+If you need a CUDA-specific PyTorch wheel, install PyTorch first according to your CUDA version. Versions used during development:
 
 ```text
 torch==2.3.1+cu118
@@ -642,7 +379,7 @@ Build the Rust/PyO3 extension:
 maturin develop -m pager/Cargo.toml --release
 ```
 
-Then verify that Python can import the module:
+Then check that Python can import it:
 
 ```bash
 python - <<'PY'
@@ -662,22 +399,22 @@ PY
 
 ---
 
-## Run demos
+## Running the demos
 
-Compile-check Python files:
+Compile-check everything first:
 
 ```bash
 python -m py_compile bench/*.py
 ```
 
-Run real tensor movement:
+Real tensor movement (no real model, dummy KV-shaped tensors):
 
 ```bash
 python bench/torch_kv_offload_mvp.py
 python bench/torch_kv_pager_integration_mvp.py
 ```
 
-Run real Qwen KV demos:
+Real Qwen KV correctness chain — extraction, roundtrip, logits, multi-token generation, paged loop, baseline comparison:
 
 ```bash
 python bench/real_kv_cache_block_mvp.py
@@ -688,54 +425,44 @@ python bench/real_kv_paged_generation_loop_mvp.py
 python bench/real_kv_paged_generation_compare_mvp.py
 ```
 
-Run persistent CPU KV paging demos:
+Persistent CPU KV paging (accepts `--tokens N` and `--quiet`):
 
 ```bash
 python bench/real_kv_persistent_cpu_paging_loop_mvp.py
 python bench/real_kv_persistent_cpu_paging_stress_mvp.py
-python bench/real_kv_persistent_policy_compare_mvp.py
-```
-
-The persistent scripts accept `--tokens N` and `--quiet`, e.g.:
-
-```bash
 python bench/real_kv_persistent_policy_compare_mvp.py --tokens 64 --quiet
 ```
 
-The most important current demo is:
-
-```bash
-python bench/real_kv_paged_generation_compare_mvp.py
-```
-
-Expected final line:
-
-```text
-OK: paged real Qwen KV loop produces identical greedy generation to baseline.
-```
+`pager_hf.PagedModel` itself, and the actual VRAM savings proof, are covered under [Python API](#python-api-pager_hfpagedmodel) and [Does this actually save VRAM?](#does-this-actually-save-vram) above — those are the two worth running first.
 
 ---
 
 ## Tests / CI
 
-There are two tiers of correctness check in this repo, and they run in different places on purpose:
+Two tiers of correctness check, deliberately kept in different places.
 
-- **Automated, in CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), no GPU needed:**
-  - `cargo test` — unit tests for the Rust pager core ([`pager/src/core.rs`](pager/src/core.rs)): policy placement, VRAM budget enforcement, sink/recent pinning, `force_rebalance`, metrics. Pure logic, deterministic, no tensors involved.
-  - `pytest tests/` — CPU-only unit tests for [`pager_hf/kv_utils.py`](pager_hf/kv_utils.py): the block extract/reconstruct round-trip (including the batch-dimension logic added for `batch_size > 1`), tail concatenation, and `past_key_values` normalization. These use plain CPU tensors and a fake block store, so they run on any GitHub-hosted runner.
-  - `python -m py_compile bench/*.py pager_hf/*.py` — catches syntax/import errors across everything else.
-- **Manual, local, real GPU + real model required:** every `bench/real_kv_*.py` script. These are the actual correctness and value proofs (`same_token_ids == True` against a real baseline, the VRAM savings numbers, batch/persistence equivalence) — they need CUDA and a downloaded model, so they don't run on free CI runners and aren't automated yet.
+Automated, in [`.github/workflows/ci.yml`](.github/workflows/ci.yml), no GPU needed:
+
+- `black --check` and `isort --check` on `pager_hf/` and `tests/` — 120-char lines, one consistent quote style, imports sorted. Settings live in `pyproject.toml`, not scattered across CI flags.
+- `cargo test` — unit tests for the Rust pager core ([`pager/src/core.rs`](pager/src/core.rs)): policy placement, VRAM budget enforcement, sink/recent pinning, `force_rebalance`, metrics. Pure logic, deterministic, no tensors involved.
+- `pytest tests/` — CPU-only unit tests for [`pager_hf/kv_utils.py`](pager_hf/kv_utils.py) (block extract/reconstruct round-trip including the batch-dimension logic, tail concatenation, `past_key_values` normalization) and for `PagedModel`'s `position_ids`/left-padding validation. Plain CPU tensors and fakes, so they run on any GitHub-hosted runner.
+- `python -m py_compile bench/*.py pager_hf/*.py` — catches syntax and import errors across everything else.
+- A packaging check that builds both wheels, installs them together, and does a smoke import — the same check that caught a real bug (`pager_hf` silently missing from a wheel) during the PyPI packaging work.
+
+Manual, local, real GPU and real model required: every `bench/real_kv_*.py` script. These are the actual correctness and value proofs — `same_token_ids == True` against a real baseline, the VRAM savings numbers, batch and persistence equivalence — and they need CUDA plus a downloaded model, so they don't run on free CI runners.
 
 Run the CI-equivalent checks locally:
 
 ```bash
-cd pager && cargo test && cd ..
 pip install -e ".[dev]"
+black --check pager_hf/ tests/
+isort --check pager_hf/ tests/
+cd pager && cargo test && cd ..
 python -m py_compile bench/*.py pager_hf/*.py
 python -m pytest tests/ -v
 ```
 
-`pager_hf.KVBlockStore` itself is not unit-tested on CPU — it exists specifically to move tensors GPU ↔ CPU and rejects non-CUDA tensors by design, so exercising it for real is what the `bench/real_kv_*.py` scripts are for.
+`pager_hf.KVBlockStore` itself isn't unit-tested on CPU — it exists specifically to move tensors GPU ↔ CPU and rejects non-CUDA tensors by design, so exercising it for real is what the `bench/real_kv_*.py` scripts are for.
 
 ---
 
@@ -743,58 +470,27 @@ python -m pytest tests/ -v
 
 This is a prototype, not a production inference backend.
 
-Current limitations:
-
-- Not integrated with vLLM yet.
-- Not integrated with LMCache yet.
-- HuggingFace forward still receives a reconstructed full GPU cache.
-- CPU/SSD tiering is not yet optimized.
-- SSD tier is simulated or mapped to CPU in current MVPs.
-- Benchmarks are small and designed for correctness/proof-of-concept, not final performance claims.
-- The Rust pager uses a logical block size for placement metrics; PyTorch demos also report real tensor bytes separately.
-- Current real model demos use `Qwen/Qwen2.5-0.5B-Instruct` only, which has a tiny KV cache per token (2 KV heads) — real VRAM pressure shows up at far shorter contexts on larger models.
-- `output_attentions=True` (needed for `heavy_hitter`/`sinks_heavy_hitter` scoring) forces eager attention, which does not scale to long context; the long-context VRAM proof therefore uses `recent_only` instead.
-
-What this project currently proves:
-
-- Rust can control KV block placement.
-- Real tensors can be moved GPU ↔ CPU.
-- Real Qwen KV blocks can survive offload/reload exactly.
-- Reconstructed real Qwen KV can produce identical logits.
-- The paged loop can produce identical greedy generation to baseline.
-
-What it does not yet prove:
-
-- End-to-end throughput improvement.
-- Lower latency in a production inference engine.
-- Native runtime integration with paged attention kernels.
-- SSD-backed production offload.
+- Not integrated with vLLM or LMCache. Looked into what vLLM integration would actually take: its extension points (`KVConnectorBase_V1`, the pluggable `OffloadingManager`) are built for cross-request KV cache reuse — prefix caching, disaggregated prefill — not for the fine-grained, attention-driven, per-block placement within one active generation that this project does. vLLM's own memory management moves whole requests between GPU and CPU (or drops and recomputes them), not individual blocks of a live request. Worth knowing: vLLM's own CPU-offload roadmap plans round-robin then LRU eviction, not anything content-aware, so there's a real gap here — closing it would mean writing a vLLM-native plugin around this project's Rust core, not reusing `pager_hf` as-is. Parked for now, not abandoned.
+- HuggingFace forward still receives a reconstructed full GPU cache each step — there's no fused kernel doing partial reconstruction, so the reconstruction cost is real and scales with block count. First measured on `Qwen2.5-1.5B-Instruct` (8-bit, GTX 1050 Ti, 4GB): at 3,000 tokens the paged run's peak GPU memory during the forward pass (3,369 MB) was actually *higher* than the unpaged baseline's peak (3,242 MB), because both `reconstruct_past_from_store` and `append_tail_to_reconstructed_past` built fresh full-cache tensors by collecting copies in a list (or a second tensor) and `torch.cat`-ing them together — the whole cache resident twice at once, twice over. Rewriting both to write directly into one pre-allocated destination tensor — sized to include the tail up front, so `append_tail_to_reconstructed_past` isn't a separate step anymore — closed the gap almost entirely: paged peak dropped to 3,241.58 MB, 0.02 MB off the baseline's 3,241.56 MB. `same_token_ids: True` throughout, zero regressions across the full test suite and bench chain. This doesn't mean paged now fits a *longer* context than baseline — the underlying limit (every token must be in the attention computation for exact correctness) is unchanged, and the pager still only saves VRAM *between* generation steps, not the peak *during* one. What it fixes is paging no longer costing *more* peak memory than not paging at all. Going below baseline's peak needs incremental cache *growth* (skip rewriting blocks that didn't change) or a real paged-attention kernel (à la vLLM) — see [Project stage](#project-stage).
+- No SSD tier. Anything not on GPU currently lives in CPU RAM; a colder third tier isn't implemented.
+- Real-model demos originally used only `Qwen/Qwen2.5-0.5B-Instruct` (2 KV heads, tiny KV cache even at long context). Since validated on `TinyLlama-1.1B-Chat` (fp16) and `Qwen2.5-1.5B-Instruct` (8-bit via `bitsandbytes`) on an actual 4GB GTX 1050 Ti — both reproduce the same byte-identical output and 100% GPU-resident KV reduction between steps, but this is also what surfaced the peak-memory limitation above.
+- The Rust pager uses a fixed logical block size (16MiB) for its own placement math, independent of how large a real tensor block actually is; the Python side separately reports real tensor bytes moved. Documented, not a bug, but worth knowing if you're trying to reconcile the two sets of numbers.
+- Benchmarks so far prove correctness and mechanism, not production throughput or latency. Nothing here has been measured against a real serving workload.
 
 ---
 
 ## License
- 
-### Apache-2.0
+
+Apache-2.0. See [LICENSE](LICENSE).
 
 ---
 
 ## Project stage
 
-Current stage:
+Research prototype, not production software.
 
-```text
-research prototype / MVP
-```
+Current milestone: a real, installable API (`pager_hf.PagedModel`) that pages KV cache for any of the four policies, at both short and long context, with session persistence and batched generation — all checked byte-identical against an unpaged baseline, plus a Rust/Python test suite in CI.
 
-Current milestone:
+Next: publish `rust-llm-pager-core` and `pager-hf` to PyPI — packaging is done and tested locally, just not uploaded yet.
 
-```text
-persistent, growing real Qwen KV store with GPU <-> CPU paging across all four
-placement policies, matching baseline greedy generation exactly
-```
-
-Next milestone:
-
-```text
-turn the MVP into a clean open-source repo and start runtime integration research
-```
+After that, the real next problem is the one found while validating on a bigger model (see [Limitations](#important-limitations)): reconstructing the full KV cache before every forward pass means peak GPU memory during a step doesn't shrink, only the memory held between steps does — so today's pager can't yet let a longer context fit on a weak GPU than would fit unpaged, which is the actual point of the project. `reconstruct_past_from_store` no longer builds a blocks-only tensor and then `torch.cat`s the tail onto it separately — it writes every block, and the tail, directly into one pre-allocated destination tensor sized for both up front; `append_tail_to_reconstructed_past` is gone, folded into that same call. On the same `Qwen2.5-1.5B` 8-bit test this took paged peak GPU memory from 127 MB *above* the unpaged baseline down to 0.02 MB — noise-level. That closes the "paging costs more than not paging" gap, but not the actual ceiling: paged peak still equals baseline peak, not less, because every token still has to be physically on GPU for the forward pass. Getting *below* baseline needs incremental cache *growth* (skip rewriting blocks that didn't change since last step, not just avoid the double-buffering) or a real paged-attention kernel, which likely means revisiting the vLLM integration question rather than continuing to build purely on top of the stock HuggingFace forward path.

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rust-llm-pager-core"
+version = "0.1.0"
+description = "Rust pager core (PyO3 extension) that decides GPU/CPU KV-cache block placement for rust-llm-pager and pager-hf."
+requires-python = ">=3.10"
+
+[tool.maturin]
+module-name = "pager"
