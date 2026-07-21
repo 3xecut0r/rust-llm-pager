@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -40,6 +42,33 @@ def test_offload_to_cpu_succeeds_within_ram_budget():
 
     assert store.has_cpu(0)
     assert not store.has_gpu(0)
+
+
+def test_offload_to_cpu_logs_error_when_ram_budget_exceeded(caplog):
+    """A rejected offload should also be visible in logs, not just as a raised exception."""
+    store = KVBlockStore(tokens_per_block=16, ram_budget_bytes=1000)
+    key, value = make_block()
+    store.put_gpu(0, key, value)
+
+    with caplog.at_level(logging.ERROR, logger="pager_hf.kv_block_store"):
+        with pytest.raises(RuntimeError, match="ram_budget exceeded"):
+            store.ensure_cpu(0)
+
+    assert any(r.levelno == logging.ERROR and "ram_budget exceeded" in r.message for r in caplog.records)
+
+
+def test_offload_to_cpu_warns_when_approaching_ram_budget(caplog):
+    """Crossing the warning threshold without exceeding the budget should log, not raise."""
+    key, value = make_block()
+    block_bytes = kv_nbytes(key, value)
+    store = KVBlockStore(tokens_per_block=16, ram_budget_bytes=int(block_bytes / 0.82))  # ~82% usage after one block
+    store.put_gpu(0, key, value)
+
+    with caplog.at_level(logging.WARNING, logger="pager_hf.kv_block_store"):
+        store.ensure_cpu(0)
+
+    assert store.has_cpu(0)
+    assert any(r.levelno == logging.WARNING and "ram_budget usage" in r.message for r in caplog.records)
 
 
 def test_offload_to_cpu_ignores_ram_budget_when_unset():

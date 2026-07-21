@@ -4,7 +4,7 @@ A Rust pager that decides which parts of an LLM's KV cache stay in GPU memory an
 
 As context length grows, the KV cache eventually stops fitting in VRAM. The usual fixes are capping context length or buying a bigger GPU. This project tries a third option: keep only the KV blocks that actually matter — recent tokens, high-attention tokens, or a mix of both — resident on the GPU, and let the rest live in system RAM until they're needed again. The placement decisions run in Rust; the actual tensor movement happens in Python through PyTorch.
 
-It's still early. Validated so far on one small model (Qwen2.5-0.5B-Instruct), Linux + CUDA only, no vLLM or SGLang integration. But the core claim holds up under testing: paging KV blocks between VRAM and RAM doesn't change generation output, and at long context it cuts GPU memory used for KV cache by 98%+.
+It's still early. Validated on Qwen2, Llama, and Mistral-family models (`Qwen2.5-0.5B`/`1.5B-Instruct`, `TinyLlama-1.1B-Chat`), Linux + CUDA only, no vLLM or SGLang integration. But the core claim holds up under testing: paging KV blocks between VRAM and RAM doesn't change generation output, it cuts GPU memory used for KV cache by 98%+ at long context, and — since a custom Triton kernel replaced the reload-everything decode path — the peak GPU memory *during* a decode step now genuinely drops below an unpaged baseline's, not just between steps.
 
 ---
 
@@ -115,7 +115,7 @@ Rust decides where each block should live; Python does the actual copying. Split
 | `heavy_hitter` | Keeps blocks with high accumulated attention score. |
 | `sinks_heavy_hitter` | Hybrid: sink blocks + a limited recent tail + whatever's left of the VRAM budget goes to the highest-attention blocks. |
 
-`sinks_heavy_hitter` is the strongest policy so far, both in the multi-needle benchmark and in how much attention mass it keeps resident on GPU. `recent_only` and `sinks_recent` don't use attention scores at all for placement, which is a real tradeoff: they're the only policies that currently scale to batched generation and don't need `output_attentions` — see [Python API](#python-api-pager_hfpagedmodel).
+`sinks_heavy_hitter` is the strongest policy so far, both in the multi-needle benchmark and in how much attention mass it keeps resident on GPU. `recent_only` and `sinks_recent` don't use attention scores at all for placement, which is a real tradeoff, though a smaller one than it used to be: all four policies now support batched generation (see [Batching](#batching-batch_size--1) in the [Python API](#python-api-pager_hfpagedmodel) section) — the two attention-scoring policies just cost a second Triton kernel pass to get that signal instead of reading it for free from the placement rule itself.
 
 ---
 
@@ -123,9 +123,9 @@ Rust decides where each block should live; Python does the actual copying. Split
 
 Everything under `bench/` is a validation script, not the intended way to use this project. `pager_hf` is the real, installable interface — a thin wrapper around a HuggingFace causal LM that reuses the same Rust pager and KV block store, minus the debug printing and CLI plumbing that the bench scripts are full of.
 
-`PagedModel` adapts itself to the policy you give it. `recent_only` and `sinks_recent` never look at attention scores for placement (see `pager/src/core.rs`), so `PagedModel` skips `output_attentions` entirely and prefills in chunks. `heavy_hitter` and `sinks_heavy_hitter` need a real attention signal, so `output_attentions=True` stays on during decoding.
+`PagedModel` adapts itself to the policy you give it. `recent_only` and `sinks_recent` never look at attention scores for placement (see `pager/src/core.rs`), so no attention signal is computed for them at all — cheapest path, and the only one usable at `batch_size > 1` before this scoring extension existed (see [Batching](#batching-batch_size--1)). `heavy_hitter` and `sinks_heavy_hitter` need a real attention signal; by default (`use_streaming_attention=True`) that comes straight out of a second Triton kernel pass (`pager_hf/streaming_attention.py`), not from HuggingFace's `output_attentions`. With `use_streaming_attention=False` (the older reconstruct-and-call path, still available), `output_attentions=True` stays on during decoding instead.
 
-Both kinds scale to long context, which wasn't obvious going in — every `PagedModel` forward call, whether priming a token or decoding one, processes exactly one token against the reconstructed cache. That means `output_attentions=True` there only costs a `[heads, 1, total_len]` matrix per layer (linear in context length), not the quadratic `[heads, seq_len, seq_len]` a bulk forward call would need. `bench/real_kv_paged_model_long_context_mvp.py --policy <name>` checks all four policies at ~6,000 tokens for byte-identical output against baseline:
+All four policies scale to long context, which wasn't obvious going in. On the fallback path, every forward call processes exactly one token against the reconstructed cache, so `output_attentions=True` there only costs a `[heads, 1, total_len]` matrix per layer (linear in context length), not the quadratic `[heads, seq_len, seq_len]` a bulk forward call would need. The default streaming path avoids reconstructing the cache at all, so this cost doesn't even apply there. `bench/real_kv_paged_model_long_context_mvp.py --policy <name>` checks all four policies at ~6,000 tokens for byte-identical output against baseline:
 
 | Policy | Same as baseline | Mean attention kept on GPU |
 |---|---|---:|
@@ -204,7 +204,11 @@ That mutable session state also means a single `PagedModel` instance isn't meant
 
 ### Batching (`batch_size > 1`)
 
-`generate()` accepts a real batch — one forward call per step across every row, not a Python loop over rows — under two constraints. Every row needs the same total length (real tokens plus padding), and `attention_mask` per row has to be zero or more leading zeros followed by all ones — standard left-padding, the usual convention for batched causal-LM generation. Right-padding or masking with gaps in the middle raises `NotImplementedError` rather than doing something quietly wrong. And it only works for `recent_only` / `sinks_recent`: those place blocks purely by recency and position, so every row in an equal-length batch gets the same placement decision, which means one shared `PyPager` and one shared `KVBlockStore` is enough. A block can be entirely padding for a shorter row and that's harmless — `attention_mask` excludes those positions from attention regardless of what's physically stored there. `heavy_hitter` / `sinks_heavy_hitter` would need per-row placement and per-row attention extraction, which doesn't exist yet, so passing one of them with `batch_size > 1` raises `NotImplementedError`.
+`generate()` accepts a real batch — one forward call per step across every row, not a Python loop over rows — under one constraint: every row needs the same total length (real tokens plus padding), and `attention_mask` per row has to be zero or more leading zeros followed by all ones — standard left-padding, the usual convention for batched causal-LM generation. Right-padding or masking with gaps in the middle raises `NotImplementedError` rather than doing something quietly wrong. This applies whether `use_streaming_attention` is on (the default) or off.
+
+All four policies now support `batch_size > 1`, including `heavy_hitter` / `sinks_heavy_hitter`. Block placement is still one decision shared by the whole batch (one `PyPager`, one `KVBlockStore` — rows can't have independently-placed blocks), so for the two attention-scoring policies the placement score is an *average* of each row's own attention across the batch, not any single row's own preference. This never affects which tokens get generated: every row's attention always covers the full context regardless of which physical tier a block sits in — placement only changes memory residency and transfer cost, not correctness — so `same_token_ids` holds at `batch_size > 1` for every policy, the same way it does at `batch_size == 1` (`bench/streaming_paged_model_batch_verify_mvp.py`).
+
+A block can be entirely padding for a shorter row and that's harmless, but *how* padding gets excluded from attention differs by path: the non-streaming path relies on HuggingFace's own `attention_mask` handling; the streaming path (default) computes its own `[batch, chunk_tokens]` validity mask per attention chunk from the same `attention_mask`, since the Triton kernel never sees HuggingFace's internal 4D causal mask at all. Both were checked against a per-row unpadded reference with genuinely different real lengths per row, not just different total padding amounts (`bench/streaming_paged_model_batch_verify_mvp.py`).
 
 Position IDs are derived from `attention_mask` (`cumsum(-1) - 1`, clamped at padded positions) rather than assumed to be a plain `0..n-1` range — that's the part that actually makes padding produce correct output instead of silently wrong output.
 
@@ -215,6 +219,23 @@ generated = paged_model.generate(input_ids=batched_ids, attention_mask=batched_m
 ```
 
 `bench/real_kv_paged_model_batch_mvp.py` checks this against the ground truth: three different-length prompts, left-padded to a common length and run together in one `batch_size=3` call, produce — row for row — byte-identical output to running each prompt alone, unpadded, at `batch_size=1`.
+
+### Observability
+
+`pager_hf` logs through the standard `logging` module under the `pager_hf` name, so a long-lived process gets visibility without adding a metrics dependency:
+
+```python
+import logging
+logging.getLogger("pager_hf").setLevel(logging.DEBUG)  # or INFO for less noise
+logging.basicConfig()  # or wire your own handler/formatter
+```
+
+- `INFO`: session lifecycle — `generate()` starting a fresh session (context length, block count, policy), `reset()`, and streaming attention activating (detected `model_type`, layers patched, group size).
+- `DEBUG`: per-decode-step stats — new blocks registered, GPU↔CPU bytes moved, fraction of attention mass currently GPU-resident.
+- `WARNING`: CPU RAM usage crossing 80% of `ram_budget`, and a `generate()`/`reset()` call rejected because another one is already in flight on the same instance — both fire *before* whatever exception (if any) also gets raised, so they're visible even if a caller catches errors silently.
+- `ERROR`: `ram_budget` actually exceeded, or `use_streaming_attention` rejected for an unrecognized architecture — logged right alongside the raised exception.
+
+For metrics rather than logs, `paged_model.last_run_stats` after each `generate()` call is a plain `dataclasses.dataclass` (`GenerationStats`) — `dataclasses.asdict(paged_model.last_run_stats)` gives a flat dict ready to push into whatever the caller already uses (Prometheus, statsd, a plain log line), no extra dependency added on this side.
 
 ### Installing and validating
 
@@ -232,7 +253,7 @@ python bench/real_kv_paged_model_batch_mvp.py         # batch_size > 1 == per-ro
 ### Current limitations of `pager_hf`
 
 - Greedy by default; temperature/top-k/top-p sampling is available via `do_sample=True` (see the [Python API](#python-api-pager_hfpagedmodel) section above), but no beam search.
-- `batch_size > 1` needs left-padding to a common total length and `recent_only`/`sinks_recent`; right-padding, gapped masking, and attention-scored policies at `batch_size > 1` aren't supported. Left-padding is the standard way to batch causal-LM generation anyway, so this isn't considered a gap to close — see [Project stage](#project-stage).
+- `batch_size > 1` needs left-padding to a common total length; right-padding or gapped masking isn't supported. Left-padding is the standard way to batch causal-LM generation anyway, so this isn't considered a gap to close. All four policies work at `batch_size > 1` now (see [Batching](#batching-batch_size--1) above).
 - New tokens beyond what's already primed get fed through the model one at a time (matching how every other script in this project scores blocks per token). Priming a very long new turn in one `generate()` call isn't chunked the way the initial prefill is.
 - Same VRAM ↔ CPU-only scope as the rest of the project — no SSD tier, no vLLM/LMCache integration.
 
@@ -335,17 +356,39 @@ bench/
   real_kv_paged_model_long_context_mvp.py
   real_kv_paged_model_persistence_mvp.py
   real_kv_paged_model_batch_mvp.py
+  real_kv_paged_model_throughput_mvp.py
   real_kv_vram_savings_proof_mvp.py
+
+  # Triton streaming-attention kernel: development history, correctness
+  # anchors, and the go/no-go checkpoints that led to pager_hf/streaming_attention.py
+  streaming_attention_prototype_mvp.py       # pure-PyTorch online-softmax proof, Stage 0
+  streaming_attention_real_layer_mvp.py      # pure-Python per-layer patch -- the too-slow dead end
+  streaming_attention_triton_kernel_mvp.py   # the Triton kernel's own dev/test file
+  streaming_attention_triton_real_layer_mvp.py
+  streaming_attention_full_loop_mvp.py       # full 24-layer streaming loop, peak-memory proof
+
+  # Verification of the shipped pager_hf.PagedModel integration, not just the kernel
+  streaming_paged_model_verify_mvp.py         # all 4 policies vs baseline, Qwen2
+  streaming_paged_model_verify_llama_mvp.py   # same, TinyLlama-1.1B
+  streaming_paged_model_verify_mistral_mvp.py # same, tiny Mistral checkpoint
+  streaming_paged_model_batch_verify_mvp.py   # batch_size > 1, heterogeneous padding, all 4 policies
+  streaming_paged_model_peak_memory_mvp.py    # real peak-GPU-memory reduction, streaming vs not
+  streaming_group_size_sweep_mvp.py           # streaming_group_size_blocks tuning
 
 pager_hf/
   __init__.py
-  kv_block_store.py  # runtime-agnostic GPU <-> CPU tensor movement primitive
-  kv_utils.py         # HuggingFace past_key_values <-> KV block conversions
-  paged_model.py      # PagedModel: the installable HF integration
+  kv_block_store.py     # runtime-agnostic GPU <-> CPU tensor movement primitive
+  kv_utils.py            # HuggingFace past_key_values <-> KV block conversions
+  paged_model.py         # PagedModel: the installable HF integration
+  streaming_attention.py # Triton streaming-attention kernels + host wrappers
 
 tests/
-  test_kv_utils.py            # CPU-only unit tests, run in CI
-  test_paged_model_padding.py # position_ids / left-padding validation, CPU-only
+  test_kv_utils.py             # CPU-only, run in CI
+  test_paged_model_padding.py  # position_ids / left-padding validation, CPU-only, run in CI
+  test_sampling.py             # do_sample/temperature/top-k/top-p, CPU-only, run in CI
+  test_concurrency.py          # generate()/reset() lock contention + logging, CPU-only, run in CI
+  test_kv_block_store.py       # GPU-only (skipped in CI, no GPU there)
+  test_streaming_attention.py  # Triton kernel correctness incl. batching/padding, GPU-only (skipped in CI)
 
 .github/workflows/
   ci.yml               # cargo test + pytest + packaging check, no GPU needed
@@ -369,6 +412,7 @@ Recommended environment:
 - PyTorch with CUDA
 - `maturin`
 - `transformers`
+- `triton` — required now that `use_streaming_attention=True` is the default; `pip install pager-hf` pulls it in automatically
 
 Example setup:
 
@@ -377,7 +421,7 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -U pip maturin
-pip install torch transformers accelerate
+pip install torch transformers triton accelerate
 ```
 
 If you need a CUDA-specific PyTorch wheel, install PyTorch first according to your CUDA version. Versions used during development:
@@ -385,6 +429,7 @@ If you need a CUDA-specific PyTorch wheel, install PyTorch first according to yo
 ```text
 torch==2.3.1+cu118
 transformers==4.44.2
+triton==3.6.0
 ```
 
 ---
@@ -453,6 +498,17 @@ python bench/real_kv_persistent_policy_compare_mvp.py --tokens 64 --quiet
 
 `pager_hf.PagedModel` itself, and the actual VRAM savings proof, are covered under [Python API](#python-api-pager_hfpagedmodel) and [Does this actually save VRAM?](#does-this-actually-save-vram) above — those are the two worth running first.
 
+Streaming attention — the Triton kernel and its integration into `PagedModel` (see [Important limitations](#important-limitations) and [Project stage](#project-stage) for the full story):
+
+```bash
+python bench/streaming_paged_model_verify_mvp.py          # all 4 policies vs baseline, Qwen2.5-0.5B
+python bench/streaming_paged_model_verify_llama_mvp.py     # same, TinyLlama-1.1B
+python bench/streaming_paged_model_verify_mistral_mvp.py   # same, a tiny Mistral checkpoint
+python bench/streaming_paged_model_batch_verify_mvp.py     # batch_size > 1, heterogeneous padding, all 4 policies
+python bench/streaming_paged_model_peak_memory_mvp.py --context-tokens 6000 --policy sinks_heavy_hitter
+python bench/streaming_group_size_sweep_mvp.py             # streaming_group_size_blocks tuning
+```
+
 ---
 
 ## Tests / CI
@@ -463,11 +519,11 @@ Automated, in [`.github/workflows/ci.yml`](.github/workflows/ci.yml), no GPU nee
 
 - `black --check` and `isort --check` on `pager_hf/` and `tests/` — 120-char lines, one consistent quote style, imports sorted. Settings live in `pyproject.toml`, not scattered across CI flags.
 - `cargo test` — unit tests for the Rust pager core ([`pager/src/core.rs`](pager/src/core.rs)): policy placement, VRAM budget enforcement, sink/recent pinning, `force_rebalance`, metrics. Pure logic, deterministic, no tensors involved.
-- `pytest tests/` — CPU-only unit tests for [`pager_hf/kv_utils.py`](pager_hf/kv_utils.py) (block extract/reconstruct round-trip including the batch-dimension logic, tail concatenation, `past_key_values` normalization) and for `PagedModel`'s `position_ids`/left-padding validation. Plain CPU tensors and fakes, so they run on any GitHub-hosted runner.
+- `pytest tests/` — most of it is CPU-only and actually runs in CI: `test_kv_utils.py` (block extract/reconstruct round-trip including the batch-dimension logic, tail concatenation, `past_key_values` normalization), `test_paged_model_padding.py` (`position_ids`/left-padding validation), `test_sampling.py` (temperature/top-k/top-p filtering), `test_concurrency.py` (lock contention, including the logging it now emits). Two files need a real GPU (`test_kv_block_store.py`, `test_streaming_attention.py` — the Triton kernels, batching, and padding-mask correctness) and are marked `skipif(not torch.cuda.is_available())`, so they run for real locally but are silently skipped on CI's GPU-less runners rather than failing.
 - `python -m py_compile bench/*.py pager_hf/*.py` — catches syntax and import errors across everything else.
 - A packaging check that builds both wheels, installs them together, and does a smoke import — the same check that caught a real bug (`pager_hf` silently missing from a wheel) during the PyPI packaging work.
 
-Manual, local, real GPU and real model required: every `bench/real_kv_*.py` script. These are the actual correctness and value proofs — `same_token_ids == True` against a real baseline, the VRAM savings numbers, batch and persistence equivalence — and they need CUDA plus a downloaded model, so they don't run on free CI runners.
+Manual, local, real GPU and real model required: every `bench/real_kv_*.py` and `bench/streaming_*.py` script. These are the actual correctness and value proofs — `same_token_ids == True` against a real baseline, the VRAM savings numbers, the peak-memory reduction numbers, batch and persistence equivalence — and they need CUDA plus a downloaded model, so they don't run on free CI runners.
 
 Run the CI-equivalent checks locally:
 
@@ -480,8 +536,6 @@ python -m py_compile bench/*.py pager_hf/*.py
 python -m pytest tests/ -v
 ```
 
-`pager_hf.KVBlockStore` itself isn't unit-tested on CPU — it exists specifically to move tensors GPU ↔ CPU and rejects non-CUDA tensors by design, so exercising it for real is what the `bench/real_kv_*.py` scripts are for.
-
 ---
 
 ## Important limitations
@@ -493,7 +547,10 @@ This is a prototype, not a production inference backend.
 - No SSD tier. Anything not on GPU currently lives in CPU RAM; a colder third tier isn't implemented. `ram_budget` is enforced now: exceeding it raises `RuntimeError` with a clear message on the offload that would go over, instead of silently growing CPU RAM without limit (previously the Rust pager's logical "SSD" tier and its "RAM" tier were both just placed on CPU with no cap at all — `ram_budget` did nothing on the Python side). It's still a hard stop, not an SSD fallback: there's nowhere further to spill to yet.
 - Real-model demos originally used only `Qwen/Qwen2.5-0.5B-Instruct` (2 KV heads, tiny KV cache even at long context). Since validated on `TinyLlama-1.1B-Chat` (fp16) and `Qwen2.5-1.5B-Instruct` (8-bit via `bitsandbytes`) on an actual 4GB GTX 1050 Ti — both reproduce the same byte-identical output and 100% GPU-resident KV reduction between steps, but this is also what surfaced the peak-memory limitation above.
 - The Rust pager uses a fixed logical block size (16MiB) for its own placement math, independent of how large a real tensor block actually is; the Python side separately reports real tensor bytes moved. Documented, not a bug, but worth knowing if you're trying to reconcile the two sets of numbers.
-- `bench/real_kv_paged_model_throughput_mvp.py` measures steady-state decode speed: on `Qwen2.5-0.5B` (GTX 1050 Ti), paged decode runs about 1.17-1.18x slower per token than the unpaged baseline (2,000 tokens: 3.07 vs 2.63 tok/s; 5,922 tokens: 1.06 vs 0.91 tok/s) — the overhead doesn't visibly grow with context length in that range, so per-step reconstruction isn't a runaway cost. That's still just one small model on one weak GPU, not a production throughput/latency characterization, and nothing here has been measured against a real serving workload (concurrent requests, varied prompt lengths, a real scheduler).
+- `bench/real_kv_paged_model_throughput_mvp.py` measures steady-state decode speed. This used to be a real cost: with the old reconstruct-and-call path (still available via `use_streaming_attention=False`), paged decode ran about 1.17-1.18x slower per token than the unpaged baseline on `Qwen2.5-0.5B` (GTX 1050 Ti) — reloading every block back to GPU and rebuilding the full cache every step, whether or not that step's attention actually needed it. With streaming attention now the default, that reload is gone entirely and the Triton kernel itself is faster than dense attention (see below), so paged decode is now *faster* than baseline, not slower: 6.46 vs 3.02 tok/s at 2,000 tokens (0.47x of baseline's time, i.e. ~2.1x the throughput). Still one small model on one weak GPU, not a production throughput/latency characterization, and nothing here has been measured against a real serving workload (concurrent requests, varied prompt lengths, a real scheduler).
+- Closed the peak-memory ceiling above with a real custom Triton kernel, wired into `pager_hf.PagedModel` and on by default — this is the one item on this list that moved from "limitation" to "done." The mechanism is streaming, block-by-block attention using the online-softmax algorithm (the exact reorganization FlashAttention uses, not an approximation). A pure-PyTorch prototype (`bench/streaming_attention_prototype_mvp.py`) proved the math exact first; hooking it into one real `Qwen2Attention` layer via monkey-patching (`bench/streaming_attention_real_layer_mvp.py` — the only extension point `transformers==4.44.2` offers, no attention-implementation plugin API before ~4.48) matched stock output exactly but was ~5x slower for *one* layer alone than the entire current 24-layer step: a pure-Python per-block loop pays kernel-launch overhead on every tiny op. Writing an actual Triton kernel fixed that — verified `tl.dot` and the alternative flash-decoding-style broadcast-`tl.sum` pattern both work correctly on this GTX 1050 Ti (Pascal) despite older discussions claiming Pascal's `tl.dot` is broken; the right primitive for this project's always-`query_len=1` decode step is the broadcast-`tl.sum` one anyway (matrix-vector, not matrix-matrix). One layer's Triton attention over the full context runs about 10x *faster* than the entire current 24-layer step, not just "not slower." The shipped kernel module (`pager_hf/streaming_attention.py`) also computes per-pager-block attention mass (a second pass, with the online-softmax stats fixed from the first) so `heavy_hitter`/`sinks_heavy_hitter` — which score blocks by attention, not just recency — get a real signal instead of needing `output_attentions=True`. `PagedModel` patches every decoder layer to stream historical blocks from the `KVBlockStore` in small groups (`streaming_group_size_blocks`, default 64 — see the note on group size below) instead of reconstructing the whole context into one GPU-resident cache first; checked token-exact against both an unpaged baseline and the reconstruct-and-call path for all four policies, with real measured peak-memory reduction on the integrated product itself (not just the `bench/` prototype): 8.5% at 3,000 tokens, 16.2% at 5,922 tokens, growing with context length. (vLLM itself was considered as a way to skip writing a kernel at all, reusing its own fast PagedAttention plus this project's Rust-scored content-aware placement on top — dead end on this hardware: vLLM hard-requires compute capability ≥7.5 and does not run on Pascal at all.)
+- `use_streaming_attention` now also supports `batch_size > 1` for every policy, including `heavy_hitter`/`sinks_heavy_hitter` (the placement score becomes an average across batch rows — see [Batching](#batching-batch_size--1) — which is fine since placement never affects generated tokens, only memory residency), and Qwen2-, Llama-, and Mistral-family decoder layers — verified end to end on `TinyLlama-1.1B-Chat` and a real (if tiny, randomly-initialized) Mistral checkpoint in addition to `Qwen2.5-0.5B-Instruct`, including a batch with genuinely different real content lengths per row (`bench/streaming_paged_model_batch_verify_mvp.py`, `bench/streaming_paged_model_verify_llama_mvp.py`, `bench/streaming_paged_model_verify_mistral_mvp.py`). The model families turned out to differ in more than attribute names: in `transformers==4.44.2`, Qwen2's rotary embedding still uses the older `rotary_emb(x, seq_len=N)` → full-table-then-index convention, while Llama's and Mistral's have already moved to `rotary_emb(x, position_ids)` → pre-indexed cos/sin — Llama's decoder layer additionally precomputes it once and shares it across layers via a `position_embeddings` kwarg that Mistral's decoder layer doesn't have at all (Mistral calls `rotary_emb` itself inside `self_attn`, same as the fallback path already needed). Getting any of this wrong doesn't crash — it silently computes a plausible-looking wrong rotation — so every convention is handled explicitly (`_compute_rope` in `paged_model.py`) rather than assumed compatible; other architectures raise `NotImplementedError` instead of guessing. A `bench/streaming_group_size_sweep_mvp.py` sweep across group sizes 4-128 found peak memory essentially flat in that range on this model (the gather buffer is tiny next to the model's own footprint) while wall-clock time dropped meaningfully with larger groups (fewer kernel launches) — 64 is past the point of diminishing returns there and is now the default, up from an untuned 16.
+- Structured logging via the standard `logging` module (`logging.getLogger("pager_hf")`), for anyone running this in a long-lived process who wants visibility without instrumenting it themselves. `INFO` logs session lifecycle (start, reset, streaming-attention activation with the detected `model_type`); `DEBUG` logs per-step transfer/placement stats; `WARNING` fires once CPU-resident bytes cross 80% of `ram_budget` (see `_RAM_BUDGET_WARNING_THRESHOLD` in `kv_block_store.py`), before the hard `RuntimeError` at 100%; contended `generate()`/`reset()` calls and rejected offloads log too, not just raise. No metrics-backend dependency added — wire the log records or `GenerationStats` (already a plain dataclass, `dataclasses.asdict()`-able) into whatever the caller already uses.
 
 ---
 
@@ -509,6 +566,8 @@ Research prototype, not production software.
 
 Current milestone: a real, installable API (`pager_hf.PagedModel`) that pages KV cache for any of the four policies, at both short and long context, with session persistence, batched generation, temperature/top-k/top-p sampling, an enforced `ram_budget`, and safe concurrent-call rejection — all checked byte-identical against an unpaged baseline (for the greedy default), plus a Rust/Python test suite in CI.
 
-Next: publish `rust-llm-pager-core` and `pager-hf` to PyPI — packaging is done and tested locally, just not uploaded yet.
+The peak-memory ceiling that used to sit here as the "real next problem" (see [Limitations](#important-limitations)) is now solved in the shipped product, not just `bench/`, and on by default: a real custom Triton kernel (`pager_hf/streaming_attention.py`), online-softmax streaming attention that carries its accumulator state across separate kernel launches, gathering only a small group of blocks into GPU memory at a time instead of the whole context. All four policies are supported, including the two that score blocks by attention (`heavy_hitter`, `sinks_heavy_hitter`) via a second Triton pass that computes per-block attention mass directly, without needing HuggingFace's own `output_attentions=True`. Measured on `Qwen2.5-0.5B-Instruct`, on the integrated `PagedModel` itself (`bench/streaming_paged_model_peak_memory_mvp.py`), with a constrained `vram_budget` so blocks genuinely offload between steps: 8.5% peak-memory reduction during the decode step at 3,000 tokens, 16.2% at 5,922 tokens — growing with context length, as it should — with `same_token_ids: True` against both an unpaged baseline and the reconstruct-and-call path, across all four policies (`bench/streaming_paged_model_verify_mvp.py`). The same kernel is also just fast enough to flip the project's own throughput number: one layer's attention over the full context runs about 10x faster than the entire current 24-layer step, and with the old per-step reload gone too, paged decode went from ~1.17x *slower* than baseline to ~2.1x *faster* (see [Limitations](#important-limitations)). vLLM was considered as a shortcut (reuse their kernel, add this project's Rust-scored placement on top) and ruled out on this exact hardware: it hard-requires compute capability ≥7.5, and the GTX 1050 Ti (6.1) simply isn't in range — confirmed by a closed upstream PR, not just documentation.
 
-After that, the real next problem is the one found while validating on a bigger model (see [Limitations](#important-limitations)): reconstructing the full KV cache before every forward pass means peak GPU memory during a step doesn't shrink, only the memory held between steps does — so today's pager can't yet let a longer context fit on a weak GPU than would fit unpaged, which is the actual point of the project. `reconstruct_past_from_store` no longer builds a blocks-only tensor and then `torch.cat`s the tail onto it separately — it writes every block, and the tail, directly into one pre-allocated destination tensor sized for both up front; `append_tail_to_reconstructed_past` is gone, folded into that same call. On the same `Qwen2.5-1.5B` 8-bit test this took paged peak GPU memory from 127 MB *above* the unpaged baseline down to 0.02 MB — noise-level. That closes the "paging costs more than not paging" gap, but not the actual ceiling: paged peak still equals baseline peak, not less, because every token still has to be physically on GPU for the forward pass. Getting *below* baseline needs incremental cache *growth* (skip rewriting blocks that didn't change since last step, not just avoid the double-buffering) or a real paged-attention kernel, which likely means revisiting the vLLM integration question rather than continuing to build purely on top of the stock HuggingFace forward path.
+What used to be opt-in caveats are now closed too: `use_streaming_attention` (now the default) supports `batch_size > 1` for *every* policy, including `heavy_hitter`/`sinks_heavy_hitter`, and Qwen2-, Llama-, and Mistral-family decoder layers — verified on `TinyLlama-1.1B-Chat` and a real Mistral checkpoint in addition to `Qwen2.5-0.5B-Instruct` (see [Limitations](#important-limitations) for what actually differs between the RoPE conventions under the hood). The group size that bounds the gather buffer was swept (`bench/streaming_group_size_sweep_mvp.py`) and bumped from an untuned 16 to 64. Structured logging was also added (`logging.getLogger("pager_hf")`) so a long-lived process has some visibility into session lifecycle, per-step transfers, and `ram_budget` pressure without needing its own instrumentation.
+
+Next: extend `use_streaming_attention` to architectures beyond Qwen2/Llama/Mistral — unscoped work, not a proven blocker. Real production readiness beyond that is a different, much bigger question than anything on this list: no integration with a serving framework (no continuous batching, no request scheduler — one `PagedModel` is one session), and no beam search. Those aren't scoped-down versions of what's here; they're separate undertakings on top of it, not "finish the library." Then: publish `rust-llm-pager-core` and `pager-hf` to PyPI — packaging is done and tested locally, just not uploaded yet.

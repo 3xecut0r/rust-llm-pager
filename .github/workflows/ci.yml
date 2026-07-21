@@ -42,7 +42,7 @@ jobs:
         run: |
           pip install maturin pytest black isort
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers
+          pip install transformers triton
           pip install -e . --no-deps
       - name: Build the Rust extension
         run: |
@@ -71,6 +71,6 @@ jobs:
       - name: Install both wheels together and smoke-test the import
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers
+          pip install transformers triton
           pip install pager/target/wheels/*.whl dist/*.whl --no-deps
           python -c "import pager; import pager_hf; pager.PyPager(128_000_000, 2_000_000_000, 64, 4, 0.05, 0.20, 'recent_only'); print('pager_hf.PagedModel:', pager_hf.PagedModel)"

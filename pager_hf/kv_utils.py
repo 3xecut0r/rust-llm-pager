@@ -77,7 +77,15 @@ def token_attention_to_blocks(attn_to_keys: torch.Tensor, *, tokens_per_block: i
 
 
 def extract_last_query_block_attention(outputs, *, tokens_per_block: int, num_blocks: int) -> list[float]:
-    """Average the last query token's attention to each block, across layers and heads."""
+    """
+    Average the last query token's attention to each block, across layers,
+    heads, and batch rows. Block placement is one decision shared by the
+    whole batch (see the batching note in generate()), so at batch_size > 1
+    this is an average across rows, not any single row's own preference --
+    correctness of the generated tokens never depends on it (every row's
+    attention always covers the full context regardless of where blocks
+    physically sit), only how well the shared placement suits each row.
+    """
     attentions = outputs.attentions
 
     if attentions is None:
@@ -85,7 +93,7 @@ def extract_last_query_block_attention(outputs, *, tokens_per_block: int, num_bl
 
     traces = [
         token_attention_to_blocks(
-            layer_attn.detach().float().cpu()[0, :, -1, :].mean(dim=0),
+            layer_attn.detach().float().cpu()[:, :, -1, :].mean(dim=(0, 1)),
             tokens_per_block=tokens_per_block,
             num_blocks=num_blocks,
         )

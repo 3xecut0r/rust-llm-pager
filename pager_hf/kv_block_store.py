@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+# Warn once CPU-resident bytes cross this fraction of ram_budget_bytes, before
+# the hard RuntimeError actually fires -- gives an operator a chance to notice
+# memory pressure building up instead of only finding out at the hard stop.
+_RAM_BUDGET_WARNING_THRESHOLD = 0.8
 
 
 @dataclass
@@ -76,12 +84,27 @@ class KVBlockStore:
             projected_bytes = self._resident_cpu_bytes + incoming_bytes
 
             if projected_bytes > self.ram_budget_bytes:
+                logger.error(
+                    "ram_budget exceeded: block %d would need %.2f MB, budget is %.2f MB.",
+                    block_id,
+                    projected_bytes / 1_000_000,
+                    self.ram_budget_bytes / 1_000_000,
+                )
                 raise RuntimeError(
                     f"ram_budget exceeded: moving block {block_id} to CPU would need "
                     f"{projected_bytes / 1_000_000:.2f} MB, budget is "
                     f"{self.ram_budget_bytes / 1_000_000:.2f} MB. There is no SSD tier "
                     "yet, so overflow can't be absorbed further; use a shorter context, "
                     "a larger ram_budget, or a bigger tokens_per_block."
+                )
+
+            if projected_bytes > _RAM_BUDGET_WARNING_THRESHOLD * self.ram_budget_bytes:
+                logger.warning(
+                    "ram_budget usage at %.0f%% after offloading block %d (%.2f MB of %.2f MB budget).",
+                    100.0 * projected_bytes / self.ram_budget_bytes,
+                    block_id,
+                    projected_bytes / 1_000_000,
+                    self.ram_budget_bytes / 1_000_000,
                 )
 
         del self.gpu_blocks[block_id]
@@ -208,3 +231,17 @@ class KVBlockStore:
             raise KeyError(f"Block {block_id} is not on GPU.")
 
         return self.gpu_blocks[block_id]
+
+    def get_any(self, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return a block's (key, value) from whichever tier it currently lives
+        on, without moving or otherwise changing its residency. For callers
+        (like streaming attention) that need to read a block's data but must
+        leave tier placement decisions entirely to the caller driving them.
+        """
+        if block_id in self.gpu_blocks:
+            return self.gpu_blocks[block_id]
+        if block_id in self.cpu_blocks:
+            return self.cpu_blocks[block_id]
+
+        raise KeyError(f"Block {block_id} is not on GPU or CPU.")
