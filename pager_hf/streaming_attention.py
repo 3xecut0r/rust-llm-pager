@@ -9,12 +9,28 @@ import triton.language as tl
 # reads per iteration of its runtime-bound loop.
 _BLOCK_KV = 64
 
-# Every kernel launches one program per (batch row, query head) pair, grid
-# size batch * num_query_heads. q/m/l/acc/block_mass are laid out
-# [batch, num_query_heads, ...] contiguously, so pid already addresses them
-# directly (pid * head_dim, pid, pid * max_blocks, ...) without decomposing
-# it -- only K/V/valid addressing needs batch_idx/kv_head split out, since
-# they're [batch, num_kv_heads or 1, tokens, ...] (a different per-batch stride).
+# GQA query-head packing width. Every kernel launches one program per (batch
+# row, KV head) pair, grid size batch * num_kv_heads. Each program packs the
+# n_rep query heads that share this KV head into one [_M_TILE, head_dim] tile
+# (padded with unused rows when n_rep < _M_TILE) so QK^T and P.V run as real
+# tl.dot matmuls -- tensor-core eligible on Ampere+, plain FMA on Pascal,
+# correct on both. This replaced an earlier one-program-per-query-head design
+# using broadcast-multiply + tl.sum: that version never engages tensor cores
+# on any hardware, and lost badly to PyTorch's cuBLAS-backed dense attention
+# at head_dim=128 on real Ampere hardware (see README's "Important
+# limitations" for the measured regression this fixes).
+#
+# q/m/l/acc/block_mass are laid out [batch, num_query_heads, ...]
+# contiguously; a program's real rows are [head_offset, head_offset+n_rep)
+# where head_offset = kv_head * n_rep (heads sharing a KV head are always
+# contiguous). Padding rows (n_rep <= row < _M_TILE) index into a
+# *neighboring* program's real data -- every load/store touching them is
+# masked with row_mask, which Triton lowers to predicated instructions that
+# never issue the actual memory transaction for masked-off lanes, so the
+# out-of-range address is never dereferenced. Requires n_rep <= _M_TILE;
+# every currently supported architecture (Qwen2, Llama, Mistral) has n_rep
+# between 2 and 8, so this never triggers today, but a future architecture
+# with wider GQA fan-out needs a bigger tile, hence the explicit guard.
 #
 # valid_ptr is a [batch, chunk_tokens] 0/1 mask excluding padding positions
 # (left-padded rows in a batch>1 call) from attention -- without it, a
@@ -22,6 +38,26 @@ _BLOCK_KV = 64
 # columns, which are physically present in the gathered K/V but must never
 # contribute. Combined with the existing out-of-range mask, not a replacement
 # for it.
+_M_TILE = 16
+
+# tl.dot requires its contraction dimension >= 16. head_dim is that dimension
+# for QK^T (block_kv, the other dot's contraction dim, is always >= 16 by
+# construction). Real models are always head_dim >= 64, but tiny test-only
+# checkpoints (e.g. hf-internal-testing/tiny-random-MistralForCausalLM,
+# head_dim=8) fall under that -- padding Q/K with zero columns up to
+# _MIN_DOT_DIM leaves the dot product's value unchanged (zeros contribute
+# nothing to the sum) while satisfying the shape constraint. A no-op for
+# every currently supported real model, since qk_dim == head_dim whenever
+# head_dim >= 16 already.
+_MIN_DOT_DIM = 16
+
+
+def _validate_n_rep(n_rep: int) -> None:
+    if n_rep > _M_TILE:
+        raise NotImplementedError(
+            f"streaming attention's GQA query-head packing supports n_rep up to {_M_TILE}, got {n_rep}. "
+            "This architecture's query/KV head ratio is wider than any currently supported model."
+        )
 
 
 @triton.jit
@@ -39,29 +75,40 @@ def _decode_attention_step_kernel(
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_kv: tl.constexpr,
+    m_tile: tl.constexpr,
+    qk_dim: tl.constexpr,
 ):
     """
-    query_len is always 1 (decode step), so QK^T and P.V are matrix-vector
-    products, computed as broadcast-multiply + tl.sum (flash-decoding
-    pattern) rather than tl.dot (which wants an M>=16 tile). Reads starting
-    (m, l, acc) online-softmax state from m_ptr/l_ptr/acc_ptr and writes the
-    updated state back, so a caller can fold in one KV group per launch
-    across many launches -- only that group's K/V needs to be GPU-resident
-    at once, not the whole context.
+    query_len is always 1 (decode step), but the n_rep query heads sharing a
+    KV head are packed into one [m_tile, head_dim] tile so QK^T/P.V run as
+    tl.dot matmuls instead of per-head broadcast-multiply + tl.sum. Reads
+    starting (m, l, acc) online-softmax state from m_ptr/l_ptr/acc_ptr and
+    writes the updated state back, so a caller can fold in one KV group per
+    launch across many launches -- only that group's K/V needs to be
+    GPU-resident at once, not the whole context.
     """
     pid = tl.program_id(0)
-    batch_idx = pid // num_query_heads
-    head_idx = pid % num_query_heads
-    kv_head = head_idx // n_rep
+    batch_idx = pid // num_kv_heads
+    kv_head = pid % num_kv_heads
+    head_offset = kv_head * n_rep
+
+    row_offsets = tl.arange(0, m_tile)
+    row_mask = row_offsets < n_rep
+    full_pid = batch_idx * num_query_heads + head_offset + row_offsets
 
     dim_offsets = tl.arange(0, head_dim)
-    q = tl.load(q_ptr + pid * head_dim + dim_offsets).to(tl.float32)
-
+    qk_offsets = tl.arange(0, qk_dim)
+    qk_col_mask = qk_offsets < head_dim
     scale = 1.0 / (head_dim**0.5)
 
-    m = tl.load(m_ptr + pid)
-    l = tl.load(l_ptr + pid)
-    acc = tl.load(acc_ptr + pid * head_dim + dim_offsets)
+    q = tl.load(
+        q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
+        mask=row_mask[:, None] & qk_col_mask[None, :],
+        other=0.0,
+    )
+    m = tl.load(m_ptr + full_pid, mask=row_mask, other=float("-inf"))
+    l = tl.load(l_ptr + full_pid, mask=row_mask, other=0.0)
+    acc = tl.load(acc_ptr + full_pid[:, None] * head_dim + dim_offsets[None, :], mask=row_mask[:, None], other=0.0)
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
@@ -72,29 +119,34 @@ def _decode_attention_step_kernel(
         valid_chunk = tl.load(valid_ptr + valid_base + offs, mask=token_mask, other=0)
         token_mask = token_mask & (valid_chunk != 0)
 
-        kv_ptrs = kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :]
-        k_chunk = tl.load(k_ptr + kv_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
-        v_chunk = tl.load(v_ptr + kv_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        k_chunk = tl.load(
+            k_ptr + kv_head_base + offs[:, None] * head_dim + qk_offsets[None, :],
+            mask=token_mask[:, None] & qk_col_mask[None, :],
+            other=0.0,
+        )
+        v_chunk = tl.load(
+            v_ptr + kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :], mask=token_mask[:, None], other=0.0
+        )
 
-        scores = tl.sum(q[None, :] * k_chunk, axis=1) * scale
-        scores = tl.where(token_mask, scores, float("-inf"))
+        scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
-        chunk_max = tl.max(scores, axis=0)
+        chunk_max = tl.max(scores, axis=1)
         m_new = tl.maximum(m, chunk_max)
         alpha = tl.exp(m - m_new)
 
-        acc = acc * alpha
+        acc = acc * alpha[:, None]
         l = l * alpha
 
-        p = tl.exp(scores - m_new)
-        acc += tl.sum(p[:, None] * v_chunk, axis=0)
-        l += tl.sum(p, axis=0)
+        p = tl.exp(scores - m_new[:, None])
+        acc += tl.dot(p.to(v_chunk.dtype), v_chunk)
+        l += tl.sum(p, axis=1)
 
         m = m_new
 
-    tl.store(m_ptr + pid, m)
-    tl.store(l_ptr + pid, l)
-    tl.store(acc_ptr + pid * head_dim + dim_offsets, acc)
+    tl.store(m_ptr + full_pid, m, mask=row_mask)
+    tl.store(l_ptr + full_pid, l, mask=row_mask)
+    tl.store(acc_ptr + full_pid[:, None] * head_dim + dim_offsets[None, :], acc, mask=row_mask[:, None])
 
 
 @triton.jit
@@ -110,20 +162,30 @@ def _decode_attention_stats_kernel(
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_kv: tl.constexpr,
+    m_tile: tl.constexpr,
+    qk_dim: tl.constexpr,
 ):
     """Pass 1 of the mass-tracking path: fold one K chunk into running (m, l) only -- no V, no acc."""
     pid = tl.program_id(0)
-    batch_idx = pid // num_query_heads
-    head_idx = pid % num_query_heads
-    kv_head = head_idx // n_rep
+    batch_idx = pid // num_kv_heads
+    kv_head = pid % num_kv_heads
+    head_offset = kv_head * n_rep
 
-    dim_offsets = tl.arange(0, head_dim)
-    q = tl.load(q_ptr + pid * head_dim + dim_offsets).to(tl.float32)
+    row_offsets = tl.arange(0, m_tile)
+    row_mask = row_offsets < n_rep
+    full_pid = batch_idx * num_query_heads + head_offset + row_offsets
 
+    qk_offsets = tl.arange(0, qk_dim)
+    qk_col_mask = qk_offsets < head_dim
     scale = 1.0 / (head_dim**0.5)
 
-    m = tl.load(m_ptr + pid)
-    l = tl.load(l_ptr + pid)
+    q = tl.load(
+        q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
+        mask=row_mask[:, None] & qk_col_mask[None, :],
+        other=0.0,
+    )
+    m = tl.load(m_ptr + full_pid, mask=row_mask, other=float("-inf"))
+    l = tl.load(l_ptr + full_pid, mask=row_mask, other=0.0)
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
@@ -135,20 +197,22 @@ def _decode_attention_stats_kernel(
         token_mask = token_mask & (valid_chunk != 0)
 
         k_chunk = tl.load(
-            k_ptr + kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :], mask=token_mask[:, None], other=0.0
-        ).to(tl.float32)
+            k_ptr + kv_head_base + offs[:, None] * head_dim + qk_offsets[None, :],
+            mask=token_mask[:, None] & qk_col_mask[None, :],
+            other=0.0,
+        )
 
-        scores = tl.sum(q[None, :] * k_chunk, axis=1) * scale
-        scores = tl.where(token_mask, scores, float("-inf"))
+        scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
-        chunk_max = tl.max(scores, axis=0)
+        chunk_max = tl.max(scores, axis=1)
         m_new = tl.maximum(m, chunk_max)
         l = l * tl.exp(m - m_new)
-        l += tl.sum(tl.exp(scores - m_new), axis=0)
+        l += tl.sum(tl.exp(scores - m_new[:, None]), axis=1)
         m = m_new
 
-    tl.store(m_ptr + pid, m)
-    tl.store(l_ptr + pid, l)
+    tl.store(m_ptr + full_pid, m, mask=row_mask)
+    tl.store(l_ptr + full_pid, l, mask=row_mask)
 
 
 @triton.jit
@@ -169,6 +233,8 @@ def _decode_attention_accumulate_kernel(
     head_dim: tl.constexpr,
     tokens_per_block: tl.constexpr,
     max_blocks: tl.constexpr,
+    m_tile: tl.constexpr,
+    qk_dim: tl.constexpr,
 ):
     """
     Pass 2 of the mass-tracking path: (m, l) are already final (from pass 1)
@@ -179,18 +245,27 @@ def _decode_attention_accumulate_kernel(
     dropped from the tile, so block ids stay aligned with the pager's own.
     """
     pid = tl.program_id(0)
-    batch_idx = pid // num_query_heads
-    head_idx = pid % num_query_heads
-    kv_head = head_idx // n_rep
+    batch_idx = pid // num_kv_heads
+    kv_head = pid % num_kv_heads
+    head_offset = kv_head * n_rep
+
+    row_offsets = tl.arange(0, m_tile)
+    row_mask = row_offsets < n_rep
+    full_pid = batch_idx * num_query_heads + head_offset + row_offsets
 
     dim_offsets = tl.arange(0, head_dim)
-    q = tl.load(q_ptr + pid * head_dim + dim_offsets).to(tl.float32)
-
+    qk_offsets = tl.arange(0, qk_dim)
+    qk_col_mask = qk_offsets < head_dim
     scale = 1.0 / (head_dim**0.5)
 
-    m_final = tl.load(m_ptr + pid)
-    l_final = tl.load(l_ptr + pid)
-    acc = tl.load(acc_ptr + pid * head_dim + dim_offsets)
+    q = tl.load(
+        q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
+        mask=row_mask[:, None] & qk_col_mask[None, :],
+        other=0.0,
+    )
+    m_final = tl.load(m_ptr + full_pid, mask=row_mask, other=float("-inf"))
+    l_final = tl.load(l_ptr + full_pid, mask=row_mask, other=1.0)
+    acc = tl.load(acc_ptr + full_pid[:, None] * head_dim + dim_offsets[None, :], mask=row_mask[:, None], other=0.0)
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
@@ -203,20 +278,25 @@ def _decode_attention_accumulate_kernel(
         valid_chunk = tl.load(valid_ptr + valid_base + offs, mask=token_mask, other=0)
         token_mask = token_mask & (valid_chunk != 0)
 
-        kv_ptrs = kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :]
-        k_chunk = tl.load(k_ptr + kv_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
-        v_chunk = tl.load(v_ptr + kv_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        k_chunk = tl.load(
+            k_ptr + kv_head_base + offs[:, None] * head_dim + qk_offsets[None, :],
+            mask=token_mask[:, None] & qk_col_mask[None, :],
+            other=0.0,
+        )
+        v_chunk = tl.load(
+            v_ptr + kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :], mask=token_mask[:, None], other=0.0
+        )
 
-        scores = tl.sum(q[None, :] * k_chunk, axis=1) * scale
-        scores = tl.where(token_mask, scores, float("-inf"))
+        scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
-        p = tl.exp(scores - m_final)
-        acc += tl.sum(p[:, None] * v_chunk, axis=0)
+        p = tl.exp(scores - m_final[:, None])
+        acc += tl.dot(p.to(v_chunk.dtype), v_chunk)
 
-        block_mass = tl.sum(p, axis=0) / l_final
-        tl.store(block_mass_ptr + pid * max_blocks + block_id_offset + local_block, block_mass)
+        block_mass = tl.sum(p, axis=1) / l_final
+        tl.store(block_mass_ptr + full_pid * max_blocks + block_id_offset + local_block, block_mass, mask=row_mask)
 
-    tl.store(acc_ptr + pid * head_dim + dim_offsets, acc)
+    tl.store(acc_ptr + full_pid[:, None] * head_dim + dim_offsets[None, :], acc, mask=row_mask[:, None])
 
 
 @triton.jit
@@ -234,6 +314,8 @@ def _decode_attention_fold_fixed_kernel(
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_kv: tl.constexpr,
+    m_tile: tl.constexpr,
+    qk_dim: tl.constexpr,
 ):
     """
     Same accumulation as pass 2, but for K/V that isn't a pager block (the
@@ -242,18 +324,27 @@ def _decode_attention_fold_fixed_kernel(
     pass 1, via _decode_attention_stats_kernel).
     """
     pid = tl.program_id(0)
-    batch_idx = pid // num_query_heads
-    head_idx = pid % num_query_heads
-    kv_head = head_idx // n_rep
+    batch_idx = pid // num_kv_heads
+    kv_head = pid % num_kv_heads
+    head_offset = kv_head * n_rep
+
+    row_offsets = tl.arange(0, m_tile)
+    row_mask = row_offsets < n_rep
+    full_pid = batch_idx * num_query_heads + head_offset + row_offsets
 
     dim_offsets = tl.arange(0, head_dim)
-    q = tl.load(q_ptr + pid * head_dim + dim_offsets).to(tl.float32)
-
+    qk_offsets = tl.arange(0, qk_dim)
+    qk_col_mask = qk_offsets < head_dim
     scale = 1.0 / (head_dim**0.5)
 
-    m_final = tl.load(m_ptr + pid)
-    l_final = tl.load(l_ptr + pid)
-    acc = tl.load(acc_ptr + pid * head_dim + dim_offsets)
+    q = tl.load(
+        q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
+        mask=row_mask[:, None] & qk_col_mask[None, :],
+        other=0.0,
+    )
+    m_final = tl.load(m_ptr + full_pid, mask=row_mask, other=float("-inf"))
+    l_final = tl.load(l_ptr + full_pid, mask=row_mask, other=1.0)
+    acc = tl.load(acc_ptr + full_pid[:, None] * head_dim + dim_offsets[None, :], mask=row_mask[:, None], other=0.0)
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
@@ -264,17 +355,22 @@ def _decode_attention_fold_fixed_kernel(
         valid_chunk = tl.load(valid_ptr + valid_base + offs, mask=token_mask, other=0)
         token_mask = token_mask & (valid_chunk != 0)
 
-        kv_ptrs = kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :]
-        k_chunk = tl.load(k_ptr + kv_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
-        v_chunk = tl.load(v_ptr + kv_ptrs, mask=token_mask[:, None], other=0.0).to(tl.float32)
+        k_chunk = tl.load(
+            k_ptr + kv_head_base + offs[:, None] * head_dim + qk_offsets[None, :],
+            mask=token_mask[:, None] & qk_col_mask[None, :],
+            other=0.0,
+        )
+        v_chunk = tl.load(
+            v_ptr + kv_head_base + offs[:, None] * head_dim + dim_offsets[None, :], mask=token_mask[:, None], other=0.0
+        )
 
-        scores = tl.sum(q[None, :] * k_chunk, axis=1) * scale
-        scores = tl.where(token_mask, scores, float("-inf"))
+        scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
-        p = tl.exp(scores - m_final)
-        acc += tl.sum(p[:, None] * v_chunk, axis=0)
+        p = tl.exp(scores - m_final[:, None])
+        acc += tl.dot(p.to(v_chunk.dtype), v_chunk)
 
-    tl.store(acc_ptr + pid * head_dim + dim_offsets, acc)
+    tl.store(acc_ptr + full_pid[:, None] * head_dim + dim_offsets[None, :], acc, mask=row_mask[:, None])
 
 
 def _default_valid(k: torch.Tensor) -> torch.Tensor:
@@ -314,10 +410,12 @@ def streaming_attention_step(
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
+    _validate_n_rep(n_rep)
+    qk_dim = max(head_dim, _MIN_DOT_DIM)
     if valid is None:
         valid = _default_valid(k)
 
-    _decode_attention_step_kernel[(batch_size * num_query_heads,)](
+    _decode_attention_step_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -331,6 +429,8 @@ def streaming_attention_step(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_kv=_BLOCK_KV,
+        m_tile=_M_TILE,
+        qk_dim=qk_dim,
     )
 
 
@@ -341,10 +441,12 @@ def streaming_attention_stats_step(
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
+    _validate_n_rep(n_rep)
+    qk_dim = max(head_dim, _MIN_DOT_DIM)
     if valid is None:
         valid = torch.ones((batch_size, total_tokens), dtype=torch.int32, device=k.device)
 
-    _decode_attention_stats_kernel[(batch_size * num_query_heads,)](
+    _decode_attention_stats_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         valid.contiguous(),
@@ -356,6 +458,8 @@ def streaming_attention_stats_step(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_kv=_BLOCK_KV,
+        m_tile=_M_TILE,
+        qk_dim=qk_dim,
     )
 
 
@@ -375,11 +479,13 @@ def streaming_attention_accumulate_step(
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
+    _validate_n_rep(n_rep)
+    qk_dim = max(head_dim, _MIN_DOT_DIM)
     max_blocks = block_mass.shape[2]
     if valid is None:
         valid = _default_valid(k)
 
-    _decode_attention_accumulate_kernel[(batch_size * num_query_heads,)](
+    _decode_attention_accumulate_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -396,6 +502,8 @@ def streaming_attention_accumulate_step(
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
         max_blocks=max_blocks,
+        m_tile=_M_TILE,
+        qk_dim=qk_dim,
     )
 
 
@@ -412,10 +520,12 @@ def streaming_attention_fold_fixed_step(
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
+    _validate_n_rep(n_rep)
+    qk_dim = max(head_dim, _MIN_DOT_DIM)
     if valid is None:
         valid = _default_valid(k)
 
-    _decode_attention_fold_fixed_kernel[(batch_size * num_query_heads,)](
+    _decode_attention_fold_fixed_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -429,6 +539,8 @@ def streaming_attention_fold_fixed_step(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_kv=_BLOCK_KV,
+        m_tile=_M_TILE,
+        qk_dim=qk_dim,
     )
 
 
