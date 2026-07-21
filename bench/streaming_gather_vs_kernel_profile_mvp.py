@@ -104,8 +104,12 @@ def main() -> None:
     print("\nProfile summary")
     print("---------------")
     print(f"total_decode_s ({NEW_TOKENS} tokens):", f"{total_s:.3f}")
-    print(f"gather_s:  {_stats['gather_s']:.3f}  ({_stats['gather_calls']} calls, {_stats['gather_s']/total_s*100:.1f}% of total)")
-    print(f"kernel_s:  {_stats['kernel_s']:.3f}  ({_stats['kernel_calls']} calls, {_stats['kernel_s']/total_s*100:.1f}% of total)")
+    print(
+        f"gather_s:  {_stats['gather_s']:.3f}  ({_stats['gather_calls']} calls, {_stats['gather_s']/total_s*100:.1f}% of total)"
+    )
+    print(
+        f"kernel_s:  {_stats['kernel_s']:.3f}  ({_stats['kernel_calls']} calls, {_stats['kernel_s']/total_s*100:.1f}% of total)"
+    )
     other_s = total_s - _stats["gather_s"] - _stats["kernel_s"]
     print(f"other_s:   {other_s:.3f}  ({other_s/total_s*100:.1f}% of total -- RoPE, o_proj, MLP, norm, tail cat, etc.)")
 

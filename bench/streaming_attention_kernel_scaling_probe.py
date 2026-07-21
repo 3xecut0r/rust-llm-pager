@@ -101,9 +101,8 @@ def main():
     token_counts = [64, 256, 1024, 2048, 4096]
     block_kv_candidates = [32, 64, 128, 256]
 
-    header = (
-        f"{'total_tokens':>12} | {'sdpa_ms':>9} | {'eager_ms':>9} |"
-        + "".join(f" bkv={bkv:>4}_ms |" for bkv in block_kv_candidates)
+    header = f"{'total_tokens':>12} | {'sdpa_ms':>9} | {'eager_ms':>9} |" + "".join(
+        f" bkv={bkv:>4}_ms |" for bkv in block_kv_candidates
     )
     print(header)
     print("-" * len(header))
