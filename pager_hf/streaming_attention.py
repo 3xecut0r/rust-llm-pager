@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tl_libdevice
 
 # Inner tile size for the intra-kernel KV loop. Independent of tokens_per_block
 # (the pager's own block size) -- this only controls how much K/V the kernel
@@ -38,6 +39,19 @@ _BLOCK_KV = 64
 # columns, which are physically present in the gathered K/V but must never
 # contribute. Combined with the existing out-of-range mask, not a replacement
 # for it.
+#
+# active_ptr is a coarser, per-row [batch] 0/1 switch: when a row has *zero*
+# real (valid) tokens anywhere in this call's chunk -- e.g. a short session
+# batched cross-session (batched_decode.py) alongside a much longer one, in a
+# KV group entirely past its own history -- the program skips the KV loop
+# outright (loop trip count 0) instead of iterating the whole chunk only to
+# have every position masked out by valid_ptr anyway. total_tokens itself is
+# unchanged and still used for addressing (every row's K/V/valid tensors keep
+# the same physical shape); only the trip count becomes per-row. A row with
+# any real data in the chunk (including the one row per session whose own
+# real/padding split falls inside this chunk) still runs the full loop,
+# exactly as before -- valid_ptr already excludes the padding within it
+# correctly, so there's nothing to gain by special-casing that row further.
 _M_TILE = 16
 
 # tl.dot requires its contraction dimension >= 16. head_dim is that dimension
@@ -66,10 +80,13 @@ def _decode_attention_step_kernel(
     k_ptr,
     v_ptr,
     valid_ptr,
+    active_ptr,
     m_ptr,
     l_ptr,
     acc_ptr,
     total_tokens,
+    scale,
+    softcap,
     n_rep: tl.constexpr,
     num_query_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -86,6 +103,15 @@ def _decode_attention_step_kernel(
     writes the updated state back, so a caller can fold in one KV group per
     launch across many launches -- only that group's K/V needs to be
     GPU-resident at once, not the whole context.
+
+    scale multiplies the raw QK^T scores (the wrapper computes 1/sqrt(head_dim)
+    when a caller doesn't override it -- e.g. Gemma2's query_pre_attn_scalar-based
+    scale differs from that default). softcap, when > 0, applies Gemma2-style
+    attn-logit softcapping (tanh(scores/softcap)*softcap) to the raw scores
+    *before* the token_mask exclusion below -- matching Gemma2Attention.forward's
+    own order (softcap on raw scores, then the causal/padding mask). softcap=0.0
+    (the sentinel for "disabled", since Triton kernel args need a concrete value,
+    not None) is a no-op, preserving every other architecture's exact behavior.
     """
     pid = tl.program_id(0)
     batch_idx = pid // num_kv_heads
@@ -99,7 +125,6 @@ def _decode_attention_step_kernel(
     dim_offsets = tl.arange(0, head_dim)
     qk_offsets = tl.arange(0, qk_dim)
     qk_col_mask = qk_offsets < head_dim
-    scale = 1.0 / (head_dim**0.5)
 
     q = tl.load(
         q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
@@ -112,8 +137,10 @@ def _decode_attention_step_kernel(
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
+    row_active = tl.load(active_ptr + batch_idx)
+    loop_bound = tl.where(row_active != 0, total_tokens, 0)
 
-    for start in range(0, total_tokens, block_kv):
+    for start in range(0, loop_bound, block_kv):
         offs = start + tl.arange(0, block_kv)
         token_mask = offs < total_tokens
         valid_chunk = tl.load(valid_ptr + valid_base + offs, mask=token_mask, other=0)
@@ -129,16 +156,25 @@ def _decode_attention_step_kernel(
         )
 
         scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        if softcap > 0.0:
+            scores = softcap * tl_libdevice.tanh(scores / softcap)
         scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
         chunk_max = tl.max(scores, axis=1)
         m_new = tl.maximum(m, chunk_max)
-        alpha = tl.exp(m - m_new)
+        # m_new stays -inf when nothing valid has been seen yet through and
+        # including this chunk (e.g. a session with zero real history blocks,
+        # batched alongside sessions that do have some -- its every group is
+        # entirely padding). m - m_new and scores - m_new are both -inf - -inf
+        # (NaN) in exactly that case; alpha=0/p=0 there is the correct,
+        # NaN-free no-op (acc/l are still their untouched zero-initial values).
+        is_empty_so_far = m_new == float("-inf")
+        alpha = tl.where(is_empty_so_far, 0.0, tl.exp(m - m_new))
 
         acc = acc * alpha[:, None]
         l = l * alpha
 
-        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(is_empty_so_far[:, None], 0.0, tl.exp(scores - m_new[:, None]))
         acc += tl.dot(p.to(v_chunk.dtype), v_chunk)
         l += tl.sum(p, axis=1)
 
@@ -154,9 +190,12 @@ def _decode_attention_stats_kernel(
     q_ptr,
     k_ptr,
     valid_ptr,
+    active_ptr,
     m_ptr,
     l_ptr,
     total_tokens,
+    scale,
+    softcap,
     n_rep: tl.constexpr,
     num_query_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -165,7 +204,8 @@ def _decode_attention_stats_kernel(
     m_tile: tl.constexpr,
     qk_dim: tl.constexpr,
 ):
-    """Pass 1 of the mass-tracking path: fold one K chunk into running (m, l) only -- no V, no acc."""
+    """Pass 1 of the mass-tracking path: fold one K chunk into running (m, l) only -- no V, no acc.
+    scale/softcap: see _decode_attention_step_kernel's docstring."""
     pid = tl.program_id(0)
     batch_idx = pid // num_kv_heads
     kv_head = pid % num_kv_heads
@@ -177,7 +217,6 @@ def _decode_attention_stats_kernel(
 
     qk_offsets = tl.arange(0, qk_dim)
     qk_col_mask = qk_offsets < head_dim
-    scale = 1.0 / (head_dim**0.5)
 
     q = tl.load(
         q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
@@ -189,8 +228,10 @@ def _decode_attention_stats_kernel(
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
+    row_active = tl.load(active_ptr + batch_idx)
+    loop_bound = tl.where(row_active != 0, total_tokens, 0)
 
-    for start in range(0, total_tokens, block_kv):
+    for start in range(0, loop_bound, block_kv):
         offs = start + tl.arange(0, block_kv)
         token_mask = offs < total_tokens
         valid_chunk = tl.load(valid_ptr + valid_base + offs, mask=token_mask, other=0)
@@ -203,12 +244,17 @@ def _decode_attention_stats_kernel(
         )
 
         scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        if softcap > 0.0:
+            scores = softcap * tl_libdevice.tanh(scores / softcap)
         scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
         chunk_max = tl.max(scores, axis=1)
         m_new = tl.maximum(m, chunk_max)
-        l = l * tl.exp(m - m_new)
-        l += tl.sum(tl.exp(scores - m_new[:, None]), axis=1)
+        # See the matching comment in _decode_attention_step_kernel: guard the
+        # nothing-valid-yet case (m_new stays -inf) to avoid -inf - -inf == NaN.
+        is_empty_so_far = m_new == float("-inf")
+        l = l * tl.where(is_empty_so_far, 0.0, tl.exp(m - m_new))
+        l += tl.sum(tl.where(is_empty_so_far[:, None], 0.0, tl.exp(scores - m_new[:, None])), axis=1)
         m = m_new
 
     tl.store(m_ptr + full_pid, m, mask=row_mask)
@@ -221,12 +267,15 @@ def _decode_attention_accumulate_kernel(
     k_ptr,
     v_ptr,
     valid_ptr,
+    active_ptr,
     m_ptr,
     l_ptr,
     acc_ptr,
     block_mass_ptr,
     block_id_offset,
     total_tokens,
+    scale,
+    softcap,
     n_rep: tl.constexpr,
     num_query_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -243,6 +292,8 @@ def _decode_attention_accumulate_kernel(
     tile received -- one pager block's worth of score, in one clean number.
     A padded position still gets a (zero) mass entry rather than being
     dropped from the tile, so block ids stay aligned with the pager's own.
+
+    scale/softcap: see _decode_attention_step_kernel's docstring.
     """
     pid = tl.program_id(0)
     batch_idx = pid // num_kv_heads
@@ -256,7 +307,6 @@ def _decode_attention_accumulate_kernel(
     dim_offsets = tl.arange(0, head_dim)
     qk_offsets = tl.arange(0, qk_dim)
     qk_col_mask = qk_offsets < head_dim
-    scale = 1.0 / (head_dim**0.5)
 
     q = tl.load(
         q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
@@ -269,7 +319,8 @@ def _decode_attention_accumulate_kernel(
 
     kv_head_base = batch_idx * num_kv_heads * total_tokens * head_dim + kv_head * total_tokens * head_dim
     valid_base = batch_idx * total_tokens
-    num_local_blocks = (total_tokens + tokens_per_block - 1) // tokens_per_block
+    row_active = tl.load(active_ptr + batch_idx)
+    num_local_blocks = tl.where(row_active != 0, (total_tokens + tokens_per_block - 1) // tokens_per_block, 0)
 
     for local_block in range(0, num_local_blocks):
         start = local_block * tokens_per_block
@@ -288,6 +339,8 @@ def _decode_attention_accumulate_kernel(
         )
 
         scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        if softcap > 0.0:
+            scores = softcap * tl_libdevice.tanh(scores / softcap)
         scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
         p = tl.exp(scores - m_final[:, None])
@@ -309,6 +362,8 @@ def _decode_attention_fold_fixed_kernel(
     l_ptr,
     acc_ptr,
     total_tokens,
+    scale,
+    softcap,
     n_rep: tl.constexpr,
     num_query_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -321,7 +376,8 @@ def _decode_attention_fold_fixed_kernel(
     Same accumulation as pass 2, but for K/V that isn't a pager block (the
     tail) -- no block_mass write. m, l must already be final and are not
     updated further (the caller already folded this same K into them during
-    pass 1, via _decode_attention_stats_kernel).
+    pass 1, via _decode_attention_stats_kernel). scale/softcap: see
+    _decode_attention_step_kernel's docstring.
     """
     pid = tl.program_id(0)
     batch_idx = pid // num_kv_heads
@@ -335,7 +391,6 @@ def _decode_attention_fold_fixed_kernel(
     dim_offsets = tl.arange(0, head_dim)
     qk_offsets = tl.arange(0, qk_dim)
     qk_col_mask = qk_offsets < head_dim
-    scale = 1.0 / (head_dim**0.5)
 
     q = tl.load(
         q_ptr + full_pid[:, None] * head_dim + qk_offsets[None, :],
@@ -365,6 +420,8 @@ def _decode_attention_fold_fixed_kernel(
         )
 
         scores = tl.dot(q, tl.trans(k_chunk)) * scale
+        if softcap > 0.0:
+            scores = softcap * tl_libdevice.tanh(scores / softcap)
         scores = tl.where(token_mask[None, :], scores, float("-inf"))
 
         p = tl.exp(scores - m_final[:, None])
@@ -377,6 +434,11 @@ def _default_valid(k: torch.Tensor) -> torch.Tensor:
     """All-valid mask (no padding excluded), used when a caller doesn't pass one -- e.g. synthetic/single-row tests."""
     batch_size, _, total_tokens, _ = k.shape
     return torch.ones((batch_size, total_tokens), dtype=torch.int32, device=k.device)
+
+
+def _default_active(batch_size: int, device: torch.device) -> torch.Tensor:
+    """All-active [batch] switch (no row skipped), used when a caller doesn't pass one -- preserves the pre-skip-optimization behavior exactly."""
+    return torch.ones((batch_size,), dtype=torch.int32, device=device)
 
 
 def streaming_attention_state_init(batch_size: int, num_query_heads: int, head_dim: int, device: torch.device):
@@ -395,12 +457,22 @@ def streaming_attention_step(
     l: torch.Tensor,
     acc: torch.Tensor,
     valid: torch.Tensor | None = None,
+    active: torch.Tensor | None = None,
+    scale: float | None = None,
+    softcap: float | None = None,
 ) -> None:
     """
     Fold one KV chunk into the running (m, l, acc) state, in place.
 
     q: [batch, num_query_heads, head_dim]. k, v: [batch, num_kv_heads, chunk_tokens, head_dim].
     valid: optional [batch, chunk_tokens] 0/1 mask (1 = real token, 0 = padding); defaults to all-valid.
+    active: optional [batch] 0/1 switch; a row with active=0 skips this chunk's KV loop
+    entirely (must have zero valid tokens in it -- see the module-level active_ptr comment
+    above _decode_attention_step_kernel); defaults to all-active (today's behavior, unchanged).
+    scale: optional override for the QK^T score scale; defaults to 1/sqrt(head_dim) (every
+    currently-supported architecture except Gemma2, which uses query_pre_attn_scalar instead).
+    softcap: optional Gemma2-style attn-logit softcapping value; None/0.0 disables it (every
+    other architecture).
 
     The kernel's pointer arithmetic assumes a tightly-packed layout; a
     non-contiguous slice of a larger tensor keeps the *original* tensor's
@@ -414,16 +486,23 @@ def streaming_attention_step(
     qk_dim = max(head_dim, _MIN_DOT_DIM)
     if valid is None:
         valid = _default_valid(k)
+    if active is None:
+        active = _default_active(batch_size, k.device)
+    if scale is None:
+        scale = 1.0 / (head_dim**0.5)
 
     _decode_attention_step_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         valid.contiguous(),
+        active.contiguous(),
         m,
         l,
         acc,
         total_tokens,
+        scale,
+        softcap or 0.0,
         n_rep=n_rep,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
@@ -435,9 +514,20 @@ def streaming_attention_step(
 
 
 def streaming_attention_stats_step(
-    q: torch.Tensor, k: torch.Tensor, m: torch.Tensor, l: torch.Tensor, valid: torch.Tensor | None = None
+    q: torch.Tensor,
+    k: torch.Tensor,
+    m: torch.Tensor,
+    l: torch.Tensor,
+    valid: torch.Tensor | None = None,
+    active: torch.Tensor | None = None,
+    scale: float | None = None,
+    softcap: float | None = None,
 ) -> None:
-    """Pass 1: fold one KV chunk's K into running (m, l) only. q: [batch, num_query_heads, head_dim], k: [batch, num_kv_heads, chunk_tokens, head_dim]."""
+    """Pass 1: fold one KV chunk's K into running (m, l) only. q: [batch, num_query_heads, head_dim], k: [batch, num_kv_heads, chunk_tokens, head_dim].
+
+    active: optional [batch] 0/1 switch; see streaming_attention_step's docstring. Defaults to all-active.
+    scale/softcap: see streaming_attention_step's docstring.
+    """
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
@@ -445,14 +535,21 @@ def streaming_attention_stats_step(
     qk_dim = max(head_dim, _MIN_DOT_DIM)
     if valid is None:
         valid = torch.ones((batch_size, total_tokens), dtype=torch.int32, device=k.device)
+    if active is None:
+        active = _default_active(batch_size, k.device)
+    if scale is None:
+        scale = 1.0 / (head_dim**0.5)
 
     _decode_attention_stats_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         valid.contiguous(),
+        active.contiguous(),
         m,
         l,
         total_tokens,
+        scale,
+        softcap or 0.0,
         n_rep=n_rep,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
@@ -474,8 +571,18 @@ def streaming_attention_accumulate_step(
     block_id_offset: int,
     tokens_per_block: int,
     valid: torch.Tensor | None = None,
+    active: torch.Tensor | None = None,
+    scale: float | None = None,
+    softcap: float | None = None,
 ) -> None:
-    """Pass 2: fold one pager-block-aligned KV group into acc, and write its per-block attention mass."""
+    """Pass 2: fold one pager-block-aligned KV group into acc, and write its per-block attention mass.
+
+    active: optional [batch] 0/1 switch; see streaming_attention_step's docstring. A skipped row's
+    block_mass entries for this group are left untouched -- correct as long as block_mass was
+    zero-initialized by the caller (matching what the masked-out computation would have produced
+    anyway), which batched_decode_step already does. Defaults to all-active.
+    scale/softcap: see streaming_attention_step's docstring.
+    """
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
@@ -484,18 +591,25 @@ def streaming_attention_accumulate_step(
     max_blocks = block_mass.shape[2]
     if valid is None:
         valid = _default_valid(k)
+    if active is None:
+        active = _default_active(batch_size, k.device)
+    if scale is None:
+        scale = 1.0 / (head_dim**0.5)
 
     _decode_attention_accumulate_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
         valid.contiguous(),
+        active.contiguous(),
         m,
         l,
         acc,
         block_mass,
         block_id_offset,
         total_tokens,
+        scale,
+        softcap or 0.0,
         n_rep=n_rep,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
@@ -515,8 +629,11 @@ def streaming_attention_fold_fixed_step(
     l: torch.Tensor,
     acc: torch.Tensor,
     valid: torch.Tensor | None = None,
+    scale: float | None = None,
+    softcap: float | None = None,
 ) -> None:
-    """Pass 2 fold for a non-block chunk (the tail): accumulate acc only, no mass write."""
+    """Pass 2 fold for a non-block chunk (the tail): accumulate acc only, no mass write.
+    scale/softcap: see streaming_attention_step's docstring."""
     batch_size, num_query_heads, head_dim = q.shape
     _, num_kv_heads, total_tokens, _ = k.shape
     n_rep = num_query_heads // num_kv_heads
@@ -524,6 +641,8 @@ def streaming_attention_fold_fixed_step(
     qk_dim = max(head_dim, _MIN_DOT_DIM)
     if valid is None:
         valid = _default_valid(k)
+    if scale is None:
+        scale = 1.0 / (head_dim**0.5)
 
     _decode_attention_fold_fixed_kernel[(batch_size * num_kv_heads,)](
         q.contiguous(),
@@ -534,6 +653,8 @@ def streaming_attention_fold_fixed_step(
         l,
         acc,
         total_tokens,
+        scale,
+        softcap or 0.0,
         n_rep=n_rep,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,

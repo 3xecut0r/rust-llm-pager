@@ -121,9 +121,25 @@ def reconstruct_past_from_store(
     blocks-only tensor and then torch.cat-ing the tail onto it: the old way
     needs the whole reconstructed cache resident twice at once (once as the
     blocks-only result, again as the cat output), this way needs it once.
+
+    num_blocks can be 0 (a prompt shorter than one tokens_per_block leaves
+    everything in the tail for the first several decode steps) -- there's
+    nothing in the store to sample a shape from then, so the shape/dtype
+    comes from tail_past instead.
     """
-    sample_key, _ = store.get_gpu(0)
-    batch_size, tokens_per_block, kv_heads, head_dim = sample_key[0].shape
+    if num_blocks > 0:
+        sample_key, _ = store.get_gpu(0)
+        batch_size, tokens_per_block, kv_heads, head_dim = sample_key[0].shape
+        layer_dtypes = [sample_key[layer_idx].dtype for layer_idx in range(num_layers)]
+        layer_devices = [sample_key[layer_idx].device for layer_idx in range(num_layers)]
+    else:
+        if not tail_past:
+            raise ValueError("reconstruct_past_from_store: no blocks and no tail to reconstruct from.")
+        batch_size, kv_heads, _, head_dim = tail_past[0][0].shape
+        tokens_per_block = 0  # unused below: tail_start is 0 regardless of this value when num_blocks == 0
+        layer_dtypes = [tail_past[layer_idx][0].dtype for layer_idx in range(num_layers)]
+        layer_devices = [tail_past[layer_idx][0].device for layer_idx in range(num_layers)]
+
     tail_tokens = tail_past[0][0].shape[2] if tail_past else 0
     tail_start = num_blocks * tokens_per_block
     total_tokens = tail_start + tail_tokens
@@ -132,13 +148,13 @@ def reconstruct_past_from_store(
         (
             torch.empty(
                 (batch_size, kv_heads, total_tokens, head_dim),
-                dtype=sample_key[layer_idx].dtype,
-                device=sample_key[layer_idx].device,
+                dtype=layer_dtypes[layer_idx],
+                device=layer_devices[layer_idx],
             ),
             torch.empty(
                 (batch_size, kv_heads, total_tokens, head_dim),
-                dtype=sample_key[layer_idx].dtype,
-                device=sample_key[layer_idx].device,
+                dtype=layer_dtypes[layer_idx],
+                device=layer_devices[layer_idx],
             ),
         )
         for layer_idx in range(num_layers)

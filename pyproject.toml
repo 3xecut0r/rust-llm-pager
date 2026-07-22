@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "black", "isort"]
+serve = ["fastapi", "uvicorn[standard]", "prometheus_client"]
 
 [tool.setuptools.packages.find]
 include = ["pager_hf*"]

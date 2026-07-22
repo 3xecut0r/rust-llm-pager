@@ -43,26 +43,53 @@ _POLICIES_WITHOUT_ATTENTION_SIGNAL = frozenset({"recent_only", "sinks_recent"})
 # decoder layer's attribute layout (q/k/v/o_proj, rotary_emb -- shared across
 # every family below) *and* which RoPE calling convention this transformers
 # version uses for that family. In 4.44.2 they differ even though the layer
-# shape is otherwise identical: Qwen2Attention still uses the older
+# shape is otherwise identical: Qwen2Attention (and Qwen2MoE/Starcoder2, whose
+# self_attn is a straight copy of it) uses the older
 # rotary_emb(x, seq_len=N) -> full table, apply_rotary_pos_emb(..., position_ids)
-# indexes it. Llama and Mistral have both already moved to
+# indexes it. Llama, Mistral, Gemma, Phi3, and Gemma2 have all already moved to
 # rotary_emb(x, position_ids) -> pre-indexed cos/sin and an apply_rotary_pos_emb
 # with no position_ids arg -- Llama's decoder layer precomputes it once and
-# shares it across layers via a position_embeddings kwarg; Mistral's decoder
-# layer has no such kwarg at all and calls rotary_emb itself inside self_attn,
-# which is exactly the fallback branch below already covers. Verified end to
-# end (same_token_ids) on Qwen2.5-0.5B-Instruct, TinyLlama-1.1B, and a real
-# (if tiny) Mistral checkpoint; other architectures aren't recognized, so they
-# raise instead of silently computing something wrong.
-_SUPPORTED_STREAMING_MODEL_TYPES = frozenset({"qwen2", "llama", "mistral"})
-_LLAMA_STYLE_ROPE_MODEL_TYPES = frozenset({"llama", "mistral"})
+# shares it across layers via a position_embeddings kwarg; Mistral's, Gemma's,
+# Phi3's, and Gemma2's decoder layers have no such kwarg at all and call
+# rotary_emb themselves inside self_attn, which is exactly the fallback branch
+# below already covers (confirmed Phi3RotaryEmbedding/apply_rotary_pos_emb are
+# byte-identical to Llama's own, despite Phi3Attention.forward passing an extra
+# unused seq_len= to rotary_emb -- Phi3RotaryEmbedding.forward never reads it).
+# Verified end to end (same_token_ids) on Qwen2.5-0.5B-Instruct, TinyLlama-1.1B,
+# and real (if tiny) Mistral/Qwen2MoE/Starcoder2/Gemma/Phi3/Gemma2 checkpoints;
+# other architectures aren't recognized, so they raise instead of silently
+# computing something wrong.
+#
+# Phi3 and Gemma2 needed real handling beyond the RoPE dispatch, done below:
+# Phi3 fuses q/k/v into one qkv_proj linear (_project_qkv splits it); Gemma2
+# uses a non-default QK^T scale (query_pre_attn_scalar, not 1/sqrt(head_dim))
+# and attn-logit softcapping baked into the raw scores (_scale_and_softcap),
+# plus real sliding-window attention on alternating layers (_sliding_window_for_layer)
+# -- which also turned out to be a real, silent gap in the already-shipped Mistral
+# support (its eager-mode HF baseline enforces a uniform sliding_window=4096 via
+# the model-level causal mask; the streaming path here never truncated for it,
+# since it builds its own padding-only mask and ignores the incoming
+# attention_mask entirely). Fixed for both, single-session path only -- see
+# _sliding_window_for_layer's docstring for why batched_decode.py's
+# cross-session path isn't covered here.
+#
+# Still deliberately NOT included: Phi (not Phi3; o_proj is named "dense"),
+# StableLm (partial rotary -- only a head_dim slice gets rotated), Olmo/Cohere
+# (optional config-gated qk clipping / per-head qk-norm that would silently
+# compute a wrong result if unhandled) -- each needs its own explicit handling,
+# not just a frozenset entry.
+_SUPPORTED_STREAMING_MODEL_TYPES = frozenset(
+    {"qwen2", "qwen2_moe", "starcoder2", "llama", "mistral", "gemma", "phi3", "gemma2"}
+)
+_LLAMA_STYLE_ROPE_MODEL_TYPES = frozenset({"llama", "mistral", "gemma", "phi3", "gemma2"})
+_QWEN2_STYLE_ROPE_MODEL_TYPES = frozenset({"qwen2", "qwen2_moe", "starcoder2"})
 
 
 def _compute_rope(
     self_attn, model_type: str, query_states, key_states, value_states, position_ids, position_embeddings
 ):
     """Apply RoPE the way this model family's transformers implementation expects; see the note above."""
-    if model_type == "qwen2":
+    if model_type in _QWEN2_STYLE_ROPE_MODEL_TYPES:
         # cos/sin sized to the true absolute position, not the tail cache's own
         # (much shorter) length -- rotary_emb slices its table to exactly seq_len.
         kv_seq_len = int(position_ids.max().item()) + 1
@@ -72,9 +99,9 @@ def _compute_rope(
     if model_type in _LLAMA_STYLE_ROPE_MODEL_TYPES:
         # LlamaModel.forward computes (cos, sin) once from *our* position_ids and shares it
         # across every layer, passed in as position_embeddings -- reuse it instead of a second,
-        # redundant rotary_emb call. Mistral's decoder layer never provides position_embeddings
-        # at all, so it always falls through to calling rotary_emb here directly -- matching
-        # what MistralAttention.forward itself does.
+        # redundant rotary_emb call. Mistral's and Gemma's decoder layers never provide
+        # position_embeddings at all, so they always fall through to calling rotary_emb
+        # here directly -- matching what MistralAttention/GemmaAttention.forward do themselves.
         if position_embeddings is not None:
             cos, sin = position_embeddings
         else:
@@ -86,6 +113,67 @@ def _compute_rope(
         f"{sorted(_SUPPORTED_STREAMING_MODEL_TYPES)} have been verified against a baseline so far "
         "-- pass use_streaming_attention=False for other architectures."
     )
+
+
+def _project_qkv(self_attn, model_type: str, hidden_states: torch.Tensor, bsz: int, q_len: int):
+    """
+    Compute (query_states, key_states, value_states), viewed and transposed to
+    [batch, heads, q_len, head_dim]. Every supported architecture except Phi3
+    keeps q_proj/k_proj/v_proj as separate linears; Phi3 fuses them into one
+    qkv_proj linear (Phi3Attention.forward splits it the same way below).
+    """
+    if model_type == "phi3":
+        qkv = self_attn.qkv_proj(hidden_states)
+        query_pos = self_attn.num_heads * self_attn.head_dim
+        kv_pos = self_attn.num_key_value_heads * self_attn.head_dim
+        q = qkv[..., :query_pos]
+        k = qkv[..., query_pos : query_pos + kv_pos]
+        v = qkv[..., query_pos + kv_pos :]
+    else:
+        q = self_attn.q_proj(hidden_states)
+        k = self_attn.k_proj(hidden_states)
+        v = self_attn.v_proj(hidden_states)
+
+    query_states = q.view(bsz, q_len, self_attn.num_heads, self_attn.head_dim).transpose(1, 2)
+    key_states = k.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+    value_states = v.view(bsz, q_len, self_attn.num_key_value_heads, self_attn.head_dim).transpose(1, 2)
+    return query_states, key_states, value_states
+
+
+def _scale_and_softcap(self_attn, model_type: str) -> tuple[float | None, float | None]:
+    """Gemma2 uses a non-default QK^T scale (query_pre_attn_scalar-based, already computed by
+    Gemma2Attention.__init__ as self.scaling -- not recomputed here) and attn-logit softcapping
+    (may genuinely be None, meaning disabled). Every other architecture uses the streaming
+    kernels' own defaults (1/sqrt(head_dim), no softcap) -- returning (None, None) for those."""
+    if model_type == "gemma2":
+        return self_attn.scaling, self_attn.config.attn_logit_softcapping
+    return None, None
+
+
+def _sliding_window_for_layer(self_attn, model_type: str) -> int | None:
+    """
+    None means full/global attention for this layer -- the common case. Only Mistral and Gemma2
+    need a real window bound in this transformers version:
+
+    - Gemma2 runs sliding-window attention on alternating layers; Gemma2Attention.__init__ already
+      computed the per-layer value as self.sliding_window (None for the global layers) -- read it
+      directly rather than re-deriving the even/odd rule here.
+    - Mistral applies its config.sliding_window uniformly to every layer. Its own eager-mode HF
+      baseline (MistralModel._update_causal_mask) really does enforce this via the causal mask --
+      confirmed by reading that function's source -- so the streaming path here was silently
+      diverging from the true baseline whenever context exceeded it (default 4096), the whole time
+      Mistral has been "supported". This fixes that, not just Gemma2's version of the same gap.
+    - Qwen2/Qwen2MoE/Starcoder2 are NOT included: their sliding-window config defaults to
+      off, and Qwen2Model._update_causal_mask (the eager-mode mask builder actually used here,
+      confirmed by reading it) doesn't reference sliding-window at all in this transformers
+      version -- the branch that does exists only in the flash-attention-2-specific forward, never
+      exercised by this project. There's no real baseline divergence to fix for them.
+    """
+    if model_type == "gemma2":
+        return self_attn.sliding_window
+    if model_type == "mistral":
+        return self_attn.config.sliding_window
+    return None
 
 
 @dataclass
@@ -142,8 +230,8 @@ class PagedModel:
         # faster -- see bench/streaming_group_size_sweep_mvp.py; 64 is past
         # the point of diminishing returns there while still bounding the
         # gather buffer for bigger contexts/models this hasn't been tested on.
-        # Requires a Qwen2-, Llama-, or Mistral-family decoder-layer structure
-        # (q/k/v/o_proj, rotary_emb -- see _SUPPORTED_STREAMING_MODEL_TYPES);
+        # Requires a Qwen2/Qwen2MoE/Starcoder2/Llama/Mistral/Gemma-family
+        # decoder-layer structure (q/k/v/o_proj, rotary_emb -- see _SUPPORTED_STREAMING_MODEL_TYPES);
         # other architectures raise a clear NotImplementedError from generate()
         # instead of silently computing something wrong -- pass
         # use_streaming_attention=False for those.
@@ -317,6 +405,241 @@ class PagedModel:
         finally:
             self._lock.release()
 
+    @torch.inference_mode()
+    def generate_beam_search(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_beams: int,
+        max_new_tokens: int,
+        *,
+        eos_token_id: int | None = None,
+        length_penalty: float = 1.0,
+        num_return_sequences: int = 1,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        generator: torch.Generator | None = None,
+    ):
+        """
+        Beam search: keeps num_beams parallel hypotheses per input prompt,
+        each with its own KV-cache history in the pager, and at every step
+        picks the best num_beams continuations across all beams of the same
+        prompt combined -- not the best continuation per row independently,
+        which is what generate() does for a real batch. That selection can
+        send one beam's history into more than one new row next step (a
+        strong beam spawning multiple children) or into none at all (a weak
+        beam dying), so this drives its own decode loop instead of
+        generate()'s, reusing _forward_step (the single-token forward plus
+        block/tier bookkeeping) unchanged for each row-advance.
+
+        input_ids can be a batch of independent prompts (batch_size > 1):
+        each runs its own num_beams-wide search independently -- top-k (or,
+        under do_sample, sampling) selection happens separately per prompt,
+        candidates are never mixed across different prompts.
+
+        length_penalty divides a candidate sequence's cumulative
+        log-probability by its length**length_penalty at final-selection
+        time only (not during the per-step search itself); default 1.0
+        matches HuggingFace's own default (>1 favors longer sequences, <1
+        favors shorter, 0 is pure cumulative log-probability with no length
+        adjustment at all). Only length_penalty=0.0 is verified byte-exact
+        against HuggingFace's own beam search reference (bench/real_kv_beam_search_mvp.py)
+        -- HuggingFace's default nonzero case additionally re-normalizes
+        scores throughout its own separate per-step hypothesis bookkeeping,
+        which isn't replicated here; nonzero length_penalty here changes the
+        final choice in the expected direction but isn't guaranteed
+        bit-for-bit identical to HuggingFace's.
+
+        num_return_sequences (1..num_beams) returns more than one final
+        candidate per prompt, ranked by length-penalized score, most likely
+        first.
+
+        do_sample=True draws each step's num_beams continuations from the
+        (temperature/top_k/top_p-filtered) joint candidate distribution via
+        sampling without replacement, instead of the deterministic top-k --
+        a real but much rarer "stochastic beam search" mode; greedy
+        (do_sample=False) is the default and the only mode verified against
+        HuggingFace's reference.
+
+        A beam that already emitted eos_token_id is "frozen" -- forced to
+        keep emitting only eos_token_id at zero further score change --
+        rather than dropped, so it stays selectable without shrinking beam
+        count mid-search.
+
+        Doesn't support resuming this session via a later generate() call
+        (unlike generate()'s own persistence contract) -- every call starts
+        fresh.
+
+        Returns (matching generate()'s batch_size convention):
+        - batch_size == 1, num_return_sequences == 1: list[int]
+        - batch_size == 1, num_return_sequences > 1: list[list[int]]
+        - batch_size > 1, num_return_sequences == 1: list[list[int]]
+        - batch_size > 1, num_return_sequences > 1: list[list[list[int]]]
+        """
+        self._acquire_or_raise()
+        try:
+            batch_size = input_ids.shape[0]
+            if num_beams < 1:
+                raise ValueError(f"num_beams must be >= 1, got {num_beams}")
+            if not 1 <= num_return_sequences <= num_beams:
+                raise ValueError(
+                    f"num_return_sequences must be between 1 and num_beams ({num_beams}), got {num_return_sequences}"
+                )
+            if do_sample:
+                if temperature <= 0:
+                    raise ValueError(f"temperature must be > 0 for sampling, got {temperature}.")
+                if top_k is not None and top_k < 1:
+                    raise ValueError(f"top_k must be >= 1, got {top_k}.")
+                if top_p is not None and not (0.0 < top_p <= 1.0):
+                    raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+            self._validate_left_padded(attention_mask)
+
+            device = input_ids.device
+            total_rows = batch_size * num_beams
+            beam_input_ids = input_ids.repeat_interleave(num_beams, dim=0)
+            beam_attention_mask = attention_mask.repeat_interleave(num_beams, dim=0)
+
+            self._start_session(beam_input_ids, beam_attention_mask)
+            streaming_patch_originals = self._patch_layers_for_streaming() if self.use_streaming_attention else None
+
+            try:
+                next_input_id = beam_input_ids[:, -1:]
+                current_attention_mask = beam_attention_mask
+
+                # Every beam within a prompt's group starts as an identical copy of
+                # that prompt, so their first-step logits are identical too -- if
+                # every beam_score started at 0, the top-k/sampling below would treat
+                # several duplicate rows as if they were distinct, independent
+                # hypotheses. Only the first beam of each group starts "active"
+                # (score 0); every other beam starts at -inf, so -inf + anything
+                # stays -inf and the first step's candidates for each prompt can only
+                # come from that one real distribution -- standard beam-search init.
+                beam_scores = torch.full((total_rows,), float("-inf"), dtype=torch.float32, device=device)
+                beam_scores[0::num_beams] = 0.0
+                beam_tokens: list[list[int]] = [[] for _ in range(total_rows)]
+                beam_finished = [False] * total_rows
+
+                for _ in range(max_new_tokens):
+                    outputs, _ = self._forward_step(next_input_id, current_attention_mask, device)
+                    log_probs = torch.log_softmax(outputs.logits[:, -1, :].float(), dim=-1)  # [total_rows, vocab]
+                    vocab_size = log_probs.shape[-1]
+
+                    # A finished beam may only "continue" with eos_token_id, at zero
+                    # additional score -- keeps it selectable without letting it keep
+                    # growing its score by emitting further real tokens.
+                    if eos_token_id is not None:
+                        for row in range(total_rows):
+                            if beam_finished[row]:
+                                frozen = torch.full_like(log_probs[row], float("-inf"))
+                                frozen[eos_token_id] = 0.0
+                                log_probs[row] = frozen
+
+                    if do_sample:
+                        scaled = log_probs / temperature
+                        if top_k is not None:
+                            kth_value = torch.topk(scaled, min(top_k, vocab_size), dim=-1).values[:, -1, None]
+                            scaled = scaled.masked_fill(scaled < kth_value, float("-inf"))
+                        if top_p is not None:
+                            sorted_scaled, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
+                            sorted_probs = torch.softmax(sorted_scaled, dim=-1)
+                            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                            sorted_scaled = sorted_scaled.masked_fill(
+                                cumulative_probs - sorted_probs > top_p, float("-inf")
+                            )
+                            scaled = torch.full_like(scaled, float("-inf")).scatter(-1, sorted_indices, sorted_scaled)
+                        candidate_log_probs = torch.log_softmax(scaled, dim=-1)
+                    else:
+                        candidate_log_probs = log_probs
+
+                    # [total_rows, vocab] -> [batch_size, num_beams * vocab]: top-k (or
+                    # sampling) below operates per prompt group, never mixing
+                    # candidates from one prompt's beams into another's selection.
+                    candidate_scores = (beam_scores.unsqueeze(1) + candidate_log_probs).view(
+                        batch_size, num_beams * vocab_size
+                    )
+
+                    if do_sample:
+                        probs = torch.softmax(candidate_scores, dim=-1)
+                        local_indices = torch.multinomial(probs, num_beams, replacement=False, generator=generator)
+                        top_scores = torch.gather(candidate_scores, 1, local_indices)
+                    else:
+                        top_scores, local_indices = torch.topk(candidate_scores, num_beams, dim=-1)
+
+                    local_parent_beams = local_indices // vocab_size  # [batch_size, num_beams]
+                    chosen_tokens = local_indices % vocab_size  # [batch_size, num_beams]
+                    group_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * num_beams
+                    global_parent_beams = (local_parent_beams + group_offsets).flatten().tolist()
+                    chosen_tokens_flat = chosen_tokens.flatten().tolist()
+
+                    beam_tokens = [
+                        beam_tokens[parent] + [token] for parent, token in zip(global_parent_beams, chosen_tokens_flat)
+                    ]
+                    beam_finished = [
+                        beam_finished[parent] or (eos_token_id is not None and token == eos_token_id)
+                        for parent, token in zip(global_parent_beams, chosen_tokens_flat)
+                    ]
+                    beam_scores = top_scores.flatten()
+
+                    self._reorder_batch(global_parent_beams)
+
+                    next_input_id = torch.tensor(chosen_tokens_flat, dtype=input_ids.dtype, device=device).unsqueeze(1)
+                    current_attention_mask = torch.cat(
+                        [
+                            current_attention_mask[global_parent_beams],
+                            torch.ones((total_rows, 1), dtype=current_attention_mask.dtype, device=device),
+                        ],
+                        dim=1,
+                    )
+
+                    if all(beam_finished):
+                        break
+            finally:
+                if streaming_patch_originals is not None:
+                    self._unpatch_layers(streaming_patch_originals)
+
+            # Final selection: rank each prompt's num_beams candidates by
+            # length-penalized score, independently per prompt group.
+            per_prompt_results: list[list[list[int]]] = []
+            for group in range(batch_size):
+                scored = []
+                for row in range(group * num_beams, (group + 1) * num_beams):
+                    tokens = beam_tokens[row]
+                    if eos_token_id is not None and eos_token_id in tokens:
+                        tokens = tokens[: tokens.index(eos_token_id) + 1]
+                    normalized_score = float(beam_scores[row]) / (max(len(tokens), 1) ** length_penalty)
+                    scored.append((normalized_score, tokens))
+                scored.sort(key=lambda item: item[0], reverse=True)
+                per_prompt_results.append([tokens for _, tokens in scored[:num_return_sequences]])
+
+            logger.info(
+                "generate_beam_search finished: batch_size=%d num_beams=%d num_return_sequences=%d",
+                batch_size,
+                num_beams,
+                num_return_sequences,
+            )
+
+            if batch_size == 1 and num_return_sequences == 1:
+                return per_prompt_results[0][0]
+            if batch_size == 1:
+                return per_prompt_results[0]
+            if num_return_sequences == 1:
+                return [group[0] for group in per_prompt_results]
+            return per_prompt_results
+        finally:
+            self._lock.release()
+
+    def _reorder_batch(self, new_row_indices: list[int]) -> None:
+        """Reindex every batch row of live session state (block store + tail) to new_row_indices."""
+        self._store.reorder_batch_rows(new_row_indices)
+
+        index = torch.tensor(new_row_indices, dtype=torch.long)
+        self._tail_past = [
+            (key.index_select(0, index.to(key.device)), value.index_select(0, index.to(value.device)))
+            for key, value in self._tail_past
+        ]
+
     @staticmethod
     def _sample_next_token(
         logits: torch.Tensor,
@@ -414,11 +737,23 @@ class PagedModel:
                 )
             )
             position_ids = self._position_ids_from_mask(current_attention_mask)[:, -1:]
+            # Explicit, not derived by HF's own default (torch.arange(0, q_len), i.e.
+            # always 0 for a single-token decode step regardless of how much is
+            # already cached) -- the same reasoning _forward_step_streaming's own
+            # cache_position already documents. Reload mode never hit this before
+            # because every previously-supported architecture's causal-mask builder
+            # happens not to depend on cache_position's absolute value for a plain
+            # DynamicCache; Gemma2's does (_update_causal_mask uses it directly),
+            # so an unset cache_position (defaulting to 0) built the wrong mask and
+            # silently produced a wrong-but-plausible result -- found via real-model
+            # verification, not by inspection.
+            cache_position = torch.full((1,), int(position_ids.max().item()), dtype=torch.long, device=device)
 
             outputs = self.model(
                 input_ids=input_id_tensor,
                 attention_mask=current_attention_mask,
                 position_ids=position_ids,
+                cache_position=cache_position,
                 past_key_values=cache,
                 use_cache=True,
                 output_attentions=self._needs_attention,
@@ -430,25 +765,38 @@ class PagedModel:
                 known_num_blocks=self._num_blocks,
             )
 
-        if self._needs_attention and self.use_streaming_attention:
-            block_attention = self._finalize_streaming_block_attention()
-        elif self._needs_attention:
-            block_attention = extract_last_query_block_attention(
-                outputs, tokens_per_block=self.tokens_per_block, num_blocks=self._num_blocks
-            )
+        # A prompt shorter than one tokens_per_block leaves _num_blocks at 0
+        # for the first several decode steps (everything still lives in the
+        # tail, nothing promoted to a full pager block yet). There's nothing
+        # for the Rust pager to score, pin, or rebalance in that state --
+        # query_block = self._num_blocks - 1 would go negative, and every
+        # policy's block_attention computation below assumes at least one
+        # block exists (a uniform 1/num_blocks vector divides by zero;
+        # attention extraction indexes a block that isn't there yet).
+        if self._num_blocks == 0:
+            block_attention: list[float] = []
+            summary_before = self._store.summary()
+            summary_after = summary_before
         else:
-            # placement doesn't use scores for this policy; a uniform
-            # vector satisfies the pager API without needing attentions.
-            block_attention = [1.0 / self._num_blocks] * self._num_blocks
+            if self._needs_attention and self.use_streaming_attention:
+                block_attention = self._finalize_streaming_block_attention()
+            elif self._needs_attention:
+                block_attention = extract_last_query_block_attention(
+                    outputs, tokens_per_block=self.tokens_per_block, num_blocks=self._num_blocks
+                )
+            else:
+                # placement doesn't use scores for this policy; a uniform
+                # vector satisfies the pager API without needing attentions.
+                block_attention = [1.0 / self._num_blocks] * self._num_blocks
 
-        query_block = self._num_blocks - 1
+            query_block = self._num_blocks - 1
 
-        summary_before = self._store.summary()
-        self._rust_pager.on_step(query_block, 0, block_attention)
-        if added_block_ids:
-            self._rust_pager.force_rebalance(query_block)
-        self._store.apply_tiers(self._rust_pager.tiers(), device)
-        summary_after = self._store.summary()
+            summary_before = self._store.summary()
+            self._rust_pager.on_step(query_block, 0, block_attention)
+            if added_block_ids:
+                self._rust_pager.force_rebalance(query_block)
+            self._store.apply_tiers(self._rust_pager.tiers(), device)
+            summary_after = self._store.summary()
 
         attention_in_gpu = sum(
             block_attention[block_id] for block_id in self._store.gpu_block_ids() if block_id < len(block_attention)
@@ -595,13 +943,7 @@ class PagedModel:
             if q_len != 1:
                 raise RuntimeError("Streaming attention forward expects one token at a time (a decode step).")
 
-            query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = (
-                self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            )
-            value_states = (
-                self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-            )
+            query_states, key_states, value_states = _project_qkv(self, model_type, hidden_states, bsz, q_len)
 
             query_states, key_states = _compute_rope(
                 self, model_type, query_states, key_states, value_states, position_ids, position_embeddings
@@ -614,6 +956,7 @@ class PagedModel:
 
             q = query_states[:, :, 0, :]  # [batch, num_heads, head_dim]
             m, l, acc = streaming_attention_state_init(bsz, q.shape[1], q.shape[2], device)
+            scale, softcap = _scale_and_softcap(self, model_type)
 
             block_ids = list(range(paged_model._num_blocks))
             group_size = paged_model.streaming_group_size_blocks
@@ -624,6 +967,19 @@ class PagedModel:
             # token. Sliced per chunk below so it always matches that chunk's length.
             full_tokens = paged_model._num_blocks * paged_model.tokens_per_block
             padding_mask = paged_model._streaming_attention_mask
+
+            # Sliding-window architectures (Mistral, Gemma2 -- see
+            # _sliding_window_for_layer): exclude any position further back than
+            # the window from *every* chunk below, by folding the exclusion into
+            # padding_mask itself once, here -- every group_valid/tail_valid slice
+            # downstream already derives from padding_mask, so this single AND
+            # covers both the block-group loop and the tail fold for free.
+            sliding_window = _sliding_window_for_layer(self, model_type)
+            if sliding_window is not None:
+                current_pos = int(position_ids.max().item())
+                col_positions = torch.arange(padding_mask.shape[1], device=device)
+                window_valid = (col_positions > (current_pos - sliding_window)).unsqueeze(0)
+                padding_mask = padding_mask.to(torch.int32) * window_valid.to(torch.int32)
 
             tail_key, tail_value = paged_model._tail_past[layer_idx]
             full_tail_key = torch.cat([tail_key, key_states], dim=2)
@@ -643,11 +999,11 @@ class PagedModel:
                     group_valid = padding_mask[
                         :, group_start_tok : group_start_tok + group_len * paged_model.tokens_per_block
                     ].to(torch.int32)
-                    streaming_attention_stats_step(q, group_key, m, l, valid=group_valid)
+                    streaming_attention_stats_step(q, group_key, m, l, valid=group_valid, scale=scale, softcap=softcap)
                     transient_bytes += moved_bytes
                     transient_copies += moved_copies
                     del group_key, group_value
-                streaming_attention_stats_step(q, full_tail_key, m, l, valid=tail_valid)
+                streaming_attention_stats_step(q, full_tail_key, m, l, valid=tail_valid, scale=scale, softcap=softcap)
 
                 block_mass = torch.zeros(
                     bsz, q.shape[1], max(paged_model._num_blocks, 1), dtype=torch.float32, device=device
@@ -672,11 +1028,15 @@ class PagedModel:
                         i,
                         paged_model.tokens_per_block,
                         valid=group_valid,
+                        scale=scale,
+                        softcap=softcap,
                     )
                     transient_bytes += moved_bytes
                     transient_copies += moved_copies
                     del group_key, group_value
-                streaming_attention_fold_fixed_step(q, full_tail_key, full_tail_value, m, l, acc, valid=tail_valid)
+                streaming_attention_fold_fixed_step(
+                    q, full_tail_key, full_tail_value, m, l, acc, valid=tail_valid, scale=scale, softcap=softcap
+                )
 
                 if paged_model._num_blocks > 0:
                     # Average over batch rows too, not just heads: block placement is one decision
@@ -696,18 +1056,29 @@ class PagedModel:
                     group_valid = padding_mask[
                         :, group_start_tok : group_start_tok + group_len * paged_model.tokens_per_block
                     ].to(torch.int32)
-                    streaming_attention_step(q, group_key, group_value, m, l, acc, valid=group_valid)
+                    streaming_attention_step(
+                        q, group_key, group_value, m, l, acc, valid=group_valid, scale=scale, softcap=softcap
+                    )
                     transient_bytes += moved_bytes
                     transient_copies += moved_copies
                     del group_key, group_value
-                streaming_attention_step(q, full_tail_key, full_tail_value, m, l, acc, valid=tail_valid)
+                streaming_attention_step(
+                    q, full_tail_key, full_tail_value, m, l, acc, valid=tail_valid, scale=scale, softcap=softcap
+                )
 
             paged_model._transient_cpu_to_gpu_bytes += transient_bytes
             paged_model._transient_cpu_to_gpu_copies += transient_copies
 
             streaming_out = streaming_attention_finalize(acc, l, q.dtype)
             attn_output = streaming_out.unsqueeze(2)  # [batch, num_heads, 1, head_dim]
-            attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+            # -1, not self.hidden_size: Gemma2 configures head_dim independently of
+            # hidden_size // num_heads (e.g. hidden_size=2304, num_heads*head_dim=2048
+            # on a real Gemma2-2B), so num_heads*head_dim can genuinely differ from
+            # hidden_size -- confirmed Gemma2Attention.forward itself uses
+            # .view(bsz, q_len, -1) here, not self.hidden_size. A no-op reshape target
+            # for every other architecture, where the two are always equal by
+            # construction.
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, -1)
             attn_output = self.o_proj(attn_output)
 
             return attn_output, None, past_key_value
@@ -753,15 +1124,33 @@ class PagedModel:
         chunk_size = self.prefill_chunk_tokens
         position_ids = self._position_ids_from_mask(prefix_attention_mask)
 
-        past = None
+        # An explicit empty DynamicCache, not None: every other supported model's
+        # own XModel.forward auto-wraps a None past_key_values into a fresh
+        # DynamicCache when use_cache=True, so passing one explicitly is a no-op
+        # for them -- but Gemma2Model.forward (confirmed by reading its source)
+        # has no such auto-wrapping at all; it just passes past_key_values
+        # straight through and returns it unchanged as next_cache. With
+        # past=None that means Gemma2Attention.forward's `if past_key_value is
+        # not None: past_key_value.update(...)` never runs, nothing ever gets
+        # cached, and the model returns past_key_values=None -- not a
+        # streaming-attention bug, a real gap in the plain prefill path that
+        # would have hit Gemma2 even with use_streaming_attention=False.
+        past = DynamicCache()
         outputs = None
 
         for start in range(0, seq_len, chunk_size):
             end = min(start + chunk_size, seq_len)
+            # Explicit, absolute cache_position -- HF's own default
+            # (torch.arange(0, chunk_len)) restarts from 0 for every chunk,
+            # which is wrong for any chunk after the first (same class of bug
+            # as _forward_step's reload branch; see that fix's comment for why
+            # this only visibly matters for Gemma2 so far, on prompts longer
+            # than prefill_chunk_tokens).
             outputs = self.model(
                 input_ids=prefix_input_ids[:, start:end],
                 attention_mask=prefix_attention_mask[:, :end],
                 position_ids=position_ids[:, start:end],
+                cache_position=torch.arange(start, end, device=prefix_input_ids.device),
                 past_key_values=past,
                 use_cache=True,
                 output_attentions=False,

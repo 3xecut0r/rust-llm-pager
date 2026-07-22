@@ -43,13 +43,18 @@ jobs:
           pip install maturin pytest black isort
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install transformers triton
+          # fastapi/prometheus_client/httpx: pure-Python, no GPU/build cost --
+          # let test_serving_scheduler.py and test_serving_app.py run for real
+          # here instead of erroring out on import (uvicorn itself isn't
+          # needed: these tests use fastapi's TestClient, never a real server).
+          pip install fastapi prometheus_client httpx
           pip install -e . --no-deps
       - name: Build the Rust extension
         run: |
           maturin build -m pager/Cargo.toml --release
           pip install pager/target/wheels/*.whl --no-deps
       - name: Byte-compile all Python sources
-        run: python -m py_compile bench/*.py pager_hf/*.py
+        run: python -m py_compile bench/*.py pager_hf/*.py pager_hf/serving/*.py
       - name: Run pytest
         run: python -m pytest tests/ -v
 

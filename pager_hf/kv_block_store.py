@@ -226,6 +226,33 @@ class KVBlockStore:
 
         return {"to_gpu": moved_to_gpu, "to_cpu": moved_to_cpu}
 
+    def reorder_batch_rows(self, new_row_indices: list[int]) -> None:
+        """
+        Reindex every registered block's batch dimension (dim 1 -- blocks are
+        stored [num_layers, batch, block_len, kv_heads, head_dim]) to
+        new_row_indices, in place, on whichever tier each block currently
+        lives on. new_row_indices[i] says "new row i's data comes from old
+        row new_row_indices[i]" -- an index repeated twice duplicates that
+        row into two new rows, an index simply omitted means that row is
+        never copied anywhere. Beam search uses this every step: a strong
+        beam can spawn more than one child (duplication), a weak one can die
+        (omission), and every surviving beam's whole KV history needs to move
+        to its new row position in one call, not just its most recent token.
+        """
+        index = torch.tensor(new_row_indices, dtype=torch.long)
+
+        for block_id, (key, value) in self.gpu_blocks.items():
+            self.gpu_blocks[block_id] = (
+                key.index_select(1, index.to(key.device)),
+                value.index_select(1, index.to(value.device)),
+            )
+
+        for block_id, (key, value) in self.cpu_blocks.items():
+            self.cpu_blocks[block_id] = (
+                key.index_select(1, index.to(key.device)),
+                value.index_select(1, index.to(value.device)),
+            )
+
     def get_gpu(self, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         if block_id not in self.gpu_blocks:
             raise KeyError(f"Block {block_id} is not on GPU.")

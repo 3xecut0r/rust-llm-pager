@@ -131,6 +131,34 @@ def test_reconstruct_past_from_store_appends_tail_past():
         assert torch.equal(rec_value[:, :, seq_len:, :], tail[layer_idx][1])
 
 
+def test_reconstruct_past_from_store_with_zero_blocks_uses_tail_only():
+    """
+    A prompt shorter than one tokens_per_block leaves num_blocks at 0 for the
+    first several decode steps (everything still lives in the tail). Real
+    bug this guards against: reconstruct_past_from_store used to call
+    store.get_gpu(0) unconditionally just to sample a shape/dtype, raising
+    KeyError against an empty store.
+    """
+    num_layers, kv_heads, head_dim = 2, 2, 4
+    tail = [(torch.randn(1, kv_heads, 5, head_dim), torch.randn(1, kv_heads, 5, head_dim)) for _ in range(num_layers)]
+
+    store = FakeBlockStore()  # no blocks registered at all
+    reconstructed = reconstruct_past_from_store(store=store, num_layers=num_layers, num_blocks=0, tail_past=tail)
+
+    assert len(reconstructed) == num_layers
+    for layer_idx in range(num_layers):
+        rec_key, rec_value = reconstructed[layer_idx]
+        assert rec_key.shape == (1, kv_heads, 5, head_dim)
+        assert torch.equal(rec_key, tail[layer_idx][0])
+        assert torch.equal(rec_value, tail[layer_idx][1])
+
+
+def test_reconstruct_past_from_store_with_zero_blocks_and_no_tail_raises():
+    store = FakeBlockStore()
+    with pytest.raises(ValueError, match="no blocks and no tail"):
+        reconstruct_past_from_store(store=store, num_layers=1, num_blocks=0, tail_past=None)
+
+
 class _FakeOutputsTuple:
     def __init__(self, past):
         self.past_key_values = tuple(past)

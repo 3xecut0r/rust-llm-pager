@@ -107,3 +107,47 @@ def test_resident_bytes_stay_correct_across_many_moves():
     expected_gpu_bytes, expected_cpu_bytes = brute_force_resident_bytes(store)
     assert store.resident_gpu_bytes() == expected_gpu_bytes
     assert store.resident_cpu_bytes() == expected_cpu_bytes
+
+
+def make_row_tagged_block(*, num_layers=2, batch=4, tokens_per_block=16, kv_heads=2, head_dim=8):
+    """A block whose every row is filled with its own row index (key) / row index + 1000 (value),
+    so reordering the batch dimension is verifiable by content, not just shape."""
+    device = torch.device("cuda")
+    shape = (num_layers, batch, tokens_per_block, kv_heads, head_dim)
+    key = torch.zeros(shape, dtype=torch.float16, device=device)
+    value = torch.zeros(shape, dtype=torch.float16, device=device)
+    for row in range(batch):
+        key[:, row] = row
+        value[:, row] = row + 1000
+    return key, value
+
+
+def test_reorder_batch_rows_reorders_duplicates_and_drops_on_both_tiers():
+    """Beam search needs all three at once: a surviving beam's row can move to a new
+    position (reorder), spawn more than one child (duplicate), or a losing beam's row can
+    simply never appear in the new indices (drop) -- and this must work whichever tier a
+    block currently lives on, without changing that tier."""
+    store = KVBlockStore(tokens_per_block=16)
+
+    gpu_key, gpu_value = make_row_tagged_block()
+    cpu_key, cpu_value = make_row_tagged_block()
+    store.put_gpu(0, gpu_key, gpu_value)
+    store.put_gpu(1, cpu_key, cpu_value)
+    store.offload_to_cpu(1)
+
+    # new row 0 <- old row 2, new row 1 <- old row 2 (duplicate), new row 2 <- old row 1,
+    # new row 3 <- old row 3. Old row 0 never appears (dropped).
+    new_row_indices = [2, 2, 1, 3]
+    store.reorder_batch_rows(new_row_indices)
+
+    reordered_gpu_key, reordered_gpu_value = store.get_gpu(0)
+    assert store.has_gpu(0)  # tier unchanged
+    for new_row, old_row in enumerate(new_row_indices):
+        assert torch.all(reordered_gpu_key[:, new_row] == old_row)
+        assert torch.all(reordered_gpu_value[:, new_row] == old_row + 1000)
+
+    assert store.has_cpu(1)  # tier unchanged
+    reordered_cpu_key, reordered_cpu_value = store.cpu_blocks[1]
+    for new_row, old_row in enumerate(new_row_indices):
+        assert torch.all(reordered_cpu_key[:, new_row] == old_row)
+        assert torch.all(reordered_cpu_value[:, new_row] == old_row + 1000)
